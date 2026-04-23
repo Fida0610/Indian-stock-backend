@@ -1,6 +1,6 @@
 # main.py
-# RATE LIMIT SAFE VERSION FOR RENDER
-# Replace your FULL existing main.py with this code
+# RATE LIMIT SAFE + CACHE FIX VERSION
+# Replace FULL main.py with this code
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,10 +23,10 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------
-# SIMPLE CACHE
+# CACHE SETTINGS
 # ---------------------------------------------------
 CACHE = {}
-CACHE_SECONDS = 900   # 15 min
+CACHE_SECONDS = 600   # 10 minutes
 
 
 # ---------------------------------------------------
@@ -84,7 +84,7 @@ def resolve_symbol(user_input):
 
 
 # ---------------------------------------------------
-# SCORE
+# SCORE ENGINE
 # ---------------------------------------------------
 def verdict_engine(pe, pb, roe, debt):
     score = 0
@@ -96,7 +96,7 @@ def verdict_engine(pe, pb, roe, debt):
 
     if pb > 0 and pb < 5:
         score += 1
-        reasons.append("Reasonable PB")
+        reasons.append("Reasonable PB ratio")
 
     if roe > 15:
         score += 2
@@ -137,26 +137,27 @@ def health():
 # ---------------------------------------------------
 @app.get("/analyze")
 def analyze(ticker: str):
-
     try:
         resolved = resolve_symbol(ticker)
 
-        # ---------------- CACHE FIRST ----------------
+        # ---------------------------------------------------
+        # CACHE HIT
+        # ---------------------------------------------------
         if resolved in CACHE:
             cached = CACHE[resolved]
 
             if time.time() - cached["time"] < CACHE_SECONDS:
+                cached["data"]["fetch_time"] = datetime.now().strftime(
+                    "%d-%b-%Y %I:%M %p"
+                )
                 return cached["data"]
 
         symbol = resolved + ".NS"
 
         stock = yf.Ticker(symbol)
 
-        # only 1 info call
+        # Lightweight calls only
         info = stock.info
-
-        # limited history call
-        hist = stock.history(period="6mo")
 
         price = to_float(
             info.get("currentPrice")
@@ -181,7 +182,6 @@ def analyze(ticker: str):
             peg = pe / profit_growth
 
         interest_cov = percent(info.get("ebitdaMargins"))
-
         roce = roe
 
         score, verdict, horizon, reasons = verdict_engine(
@@ -208,7 +208,7 @@ def analyze(ticker: str):
             "ratios": {
                 "PB Ratio": {
                     "value": safe_num(pb),
-                    "meaning": "Price vs net worth",
+                    "meaning": "Price vs book value",
                     "ideal": "Lower better"
                 },
                 "PEG": {
@@ -223,7 +223,7 @@ def analyze(ticker: str):
                 },
                 "ROCE": {
                     "value": safe_num(roce),
-                    "meaning": "Return on capital used",
+                    "meaning": "Return on capital employed",
                     "ideal": "Higher better"
                 },
                 "DebtEquity": {
@@ -233,7 +233,7 @@ def analyze(ticker: str):
                 },
                 "CurrentRatio": {
                     "value": safe_num(current_ratio),
-                    "meaning": "Short term liquidity",
+                    "meaning": "Liquidity strength",
                     "ideal": "Above 1 good"
                 },
                 "OperatingMargin": {
@@ -243,7 +243,7 @@ def analyze(ticker: str):
                 },
                 "NetMargin": {
                     "value": safe_num(npm),
-                    "meaning": "Final profit %",
+                    "meaning": "Net profit %",
                     "ideal": "Higher better"
                 },
                 "SalesGrowth": {
@@ -263,7 +263,7 @@ def analyze(ticker: str):
                 },
                 "DividendYield": {
                     "value": safe_num(divy),
-                    "meaning": "Cash return %",
+                    "meaning": "Dividend yield %",
                     "ideal": "Moderate/high good"
                 },
                 "InterestCoverage": {
@@ -274,7 +274,7 @@ def analyze(ticker: str):
             }
         }
 
-        # store cache
+        # SAVE TO CACHE
         CACHE[resolved] = {
             "time": time.time(),
             "data": data
@@ -283,9 +283,12 @@ def analyze(ticker: str):
         return data
 
     except Exception:
-
         if ticker.upper() in CACHE:
-            return CACHE[ticker.upper()]["data"]
+            cached = CACHE[ticker.upper()]
+            cached["data"]["fetch_time"] = datetime.now().strftime(
+                "%d-%b-%Y %I:%M %p"
+            )
+            return cached["data"]
 
         return {
             "error": "Temporary data source busy. Please retry in 1 minute."
