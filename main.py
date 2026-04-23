@@ -1,7 +1,7 @@
 # main.py
-# FINAL HYBRID RENDER VERSION
-# Stable + All Ratios (N/A if unavailable)
-# Replace FULL existing main.py with this code
+# FINAL PRO VERSION
+# Raw-calculated ratios + stable Render hosting + cache
+# Replace your FULL existing main.py with this code
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +10,7 @@ import yfinance as yf
 import math
 import time
 
-app = FastAPI(title="Indian Stock Analyzer API")
+app = FastAPI(title="Indian Stock Analyzer PRO")
 
 # ---------------------------------------------------
 # CORS
@@ -27,7 +27,7 @@ app.add_middleware(
 # CACHE
 # ---------------------------------------------------
 CACHE = {}
-CACHE_SECONDS = 600   # 10 min
+CACHE_SECONDS = 600   # 10 mins
 
 
 # ---------------------------------------------------
@@ -55,28 +55,37 @@ def safe_num(v, digits=2):
         return "N/A"
 
 
-def pct(v):
-    val = to_float(v)
-    if val != 0 and abs(val) < 1:
-        return val * 100
-    return val
+def pct(numerator, denominator):
+    try:
+        if denominator == 0:
+            return 0
+        return (numerator / denominator) * 100
+    except:
+        return 0
+
+
+def first(series):
+    try:
+        return to_float(series.iloc[0])
+    except:
+        return 0
 
 
 # ---------------------------------------------------
-# SYMBOL RESOLVER
+# SYMBOL MAP
 # ---------------------------------------------------
-def resolve_symbol(user_input):
-    raw = user_input.strip().upper()
+def resolve_symbol(txt):
+    raw = txt.strip().upper()
     no_space = raw.replace(" ", "")
 
     alias = {
-        "BATA": "BATAINDIA",
         "TATA STEEL": "TATASTEEL",
         "TATASTEELS": "TATASTEEL",
+        "BATA": "BATAINDIA",
         "INFOSYS": "INFY",
+        "SBI": "SBIN",
         "HDFC BANK": "HDFCBANK",
         "ICICI BANK": "ICICIBANK",
-        "SBI": "SBIN",
         "HUL": "HINDUNILVR",
         "L&T": "LT",
     }
@@ -87,7 +96,7 @@ def resolve_symbol(user_input):
 # ---------------------------------------------------
 # SCORE ENGINE
 # ---------------------------------------------------
-def score_engine(pe, pb, roe, debt):
+def get_score(pe, pb, roe, debt, current_ratio):
     score = 0
     reasons = []
 
@@ -107,10 +116,14 @@ def score_engine(pe, pb, roe, debt):
         score += 2
         reasons.append("Manageable debt")
 
-    if score >= 6:
+    if current_ratio > 1:
+        score += 1
+        reasons.append("Healthy liquidity")
+
+    if score >= 7:
         verdict = "BUY 🟢"
         horizon = "3 to 5 Years"
-    elif score >= 3:
+    elif score >= 4:
         verdict = "HOLD 🟡"
         horizon = "1 to 3 Years"
     else:
@@ -125,7 +138,7 @@ def score_engine(pe, pb, roe, debt):
 # ---------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "Indian Stock Analyzer API Running"}
+    return {"message": "Indian Stock Analyzer PRO Running"}
 
 
 @app.get("/health")
@@ -140,32 +153,31 @@ def health():
 def analyze(ticker: str):
 
     try:
-        resolved = resolve_symbol(ticker)
+        code = resolve_symbol(ticker)
 
         # CACHE
-        if resolved in CACHE:
-            cached = CACHE[resolved]
-
-            if time.time() - cached["time"] < CACHE_SECONDS:
-                cached["data"]["fetch_time"] = datetime.now().strftime(
+        if code in CACHE:
+            c = CACHE[code]
+            if time.time() - c["time"] < CACHE_SECONDS:
+                c["data"]["fetch_time"] = datetime.now().strftime(
                     "%d-%b-%Y %I:%M %p"
                 )
-                return cached["data"]
+                return c["data"]
 
-        symbol = resolved + ".NS"
+        symbol = code + ".NS"
         stock = yf.Ticker(symbol)
 
         # ---------------------------------------------------
-        # STABLE PRICE HISTORY
+        # PRICE HISTORY
         # ---------------------------------------------------
-        hist = stock.history(period="1y", auto_adjust=False)
+        hist = stock.history(period="1y")
 
         if hist.empty:
             return {"error": "No market data found"}
 
         close = hist["Close"]
 
-        price = float(close.iloc[-1])
+        price = first(close.tail(1))
         high_52 = float(close.max())
         low_52 = float(close.min())
 
@@ -173,45 +185,153 @@ def analyze(ticker: str):
         dma200 = float(close.tail(200).mean()) if len(close) >= 200 else price
 
         # ---------------------------------------------------
-        # OPTIONAL INFO (may fail, still app works)
+        # RAW FINANCIALS
         # ---------------------------------------------------
-        pe = pb = roe = debt = divy = 0
-        current_ratio = opm = npm = sales_growth = 0
-        profit_growth = peg = fcf = interest_cov = 0
+        fin = stock.financials
+        bs = stock.balance_sheet
+        cf = stock.cashflow
+
+        # Income Statement
+        revenue = 0
+        net_income = 0
+        ebit = 0
+        interest_exp = 0
 
         try:
-            info = stock.info
+            for idx in fin.index:
+                n = str(idx).lower()
 
-            pe = to_float(info.get("trailingPE"))
-            pb = to_float(info.get("priceToBook"))
-            roe = pct(info.get("returnOnEquity"))
-            debt = to_float(info.get("debtToEquity"))
-            divy = pct(info.get("dividendYield"))
+                if "total revenue" in n:
+                    revenue = first(fin.loc[idx])
 
-            current_ratio = to_float(info.get("currentRatio"))
-            opm = pct(info.get("operatingMargins"))
-            npm = pct(info.get("profitMargins"))
-            sales_growth = pct(info.get("revenueGrowth"))
-            profit_growth = pct(info.get("earningsGrowth"))
-            peg = to_float(info.get("pegRatio"))
-            fcf = to_float(info.get("freeCashflow"))
-            interest_cov = pct(info.get("ebitdaMargins"))
+                if "net income" in n:
+                    net_income = first(fin.loc[idx])
 
+                if "ebit" in n or "operating income" in n:
+                    ebit = first(fin.loc[idx])
+
+                if "interest expense" in n:
+                    interest_exp = abs(first(fin.loc[idx]))
         except:
             pass
 
-        roce = roe
+        # Balance Sheet
+        equity = 0
+        debt = 0
+        current_assets = 0
+        current_liabilities = 0
+        total_assets = 0
 
-        # Manual PEG
-        if peg == 0 and pe > 0 and profit_growth > 0:
-            peg = pe / profit_growth
+        try:
+            for idx in bs.index:
+                n = str(idx).lower()
 
-        score, verdict, horizon, reasons = score_engine(
-            pe, pb, roe, debt
+                if "stockholders equity" in n or "total equity" in n:
+                    equity = first(bs.loc[idx])
+
+                if "current assets" in n:
+                    current_assets = first(bs.loc[idx])
+
+                if "current liabilities" in n:
+                    current_liabilities = first(bs.loc[idx])
+
+                if "total assets" in n:
+                    total_assets = first(bs.loc[idx])
+
+                if "total debt" in n or "long term debt" in n:
+                    debt = first(bs.loc[idx])
+        except:
+            pass
+
+        # Cash Flow
+        operating_cf = 0
+        capex = 0
+
+        try:
+            for idx in cf.index:
+                n = str(idx).lower()
+
+                if "operating cash flow" in n:
+                    operating_cf = first(cf.loc[idx])
+
+                if "capital expenditure" in n:
+                    capex = abs(first(cf.loc[idx]))
+        except:
+            pass
+
+        # ---------------------------------------------------
+        # SHARES OUTSTANDING / MARKET FIELDS
+        # ---------------------------------------------------
+        shares = 0
+        divy = 0
+
+        try:
+            info = stock.info
+            shares = to_float(info.get("sharesOutstanding"))
+            divy = to_float(info.get("dividendYield")) * 100
+        except:
+            pass
+
+        # ---------------------------------------------------
+        # RAW CALCULATED RATIOS
+        # ---------------------------------------------------
+        eps = shares and (net_income / shares) or 0
+        book_value_ps = shares and (equity / shares) or 0
+
+        pe = price / eps if eps > 0 else 0
+        pb = price / book_value_ps if book_value_ps > 0 else 0
+
+        roe = pct(net_income, equity)
+        roce = pct(ebit, (total_assets - current_liabilities))
+        debt_equity = debt / equity if equity > 0 else 0
+        current_ratio = (
+            current_assets / current_liabilities
+            if current_liabilities > 0 else 0
+        )
+
+        op_margin = pct(ebit, revenue)
+        net_margin = pct(net_income, revenue)
+
+        fcf = operating_cf - capex if operating_cf else 0
+
+        interest_cov = (
+            ebit / interest_exp
+            if interest_exp > 0 else 0
+        )
+
+        # Growth (using yearly comparison if available)
+        sales_growth = 0
+        profit_growth = 0
+
+        try:
+            if fin.shape[1] >= 2:
+                rev_now = revenue
+                rev_prev = first(fin.loc["Total Revenue"].iloc[1:2])
+                ni_prev = first(fin.loc["Net Income"].iloc[1:2])
+
+                sales_growth = pct(
+                    rev_now - rev_prev,
+                    rev_prev
+                )
+
+                profit_growth = pct(
+                    net_income - ni_prev,
+                    ni_prev
+                )
+        except:
+            pass
+
+        peg = pe / profit_growth if profit_growth > 0 else 0
+
+        # ---------------------------------------------------
+        # SCORE
+        # ---------------------------------------------------
+        score, verdict, horizon, reasons = get_score(
+            pe, pb, roe, debt_equity, current_ratio
         )
 
         data = {
-            "stock": resolved,
+            "stock": code,
             "fetch_time": datetime.now().strftime("%d-%b-%Y %I:%M %p"),
             "score": score,
             "verdict": verdict,
@@ -223,7 +343,7 @@ def analyze(ticker: str):
                 "PE Ratio": safe_num(pe),
                 "PB Ratio": safe_num(pb),
                 "ROE": safe_num(roe),
-                "Debt to Equity": safe_num(debt),
+                "Debt to Equity": safe_num(debt_equity),
                 "Dividend Yield": safe_num(divy),
                 "52W High": safe_num(high_52),
                 "52W Low": safe_num(low_52),
@@ -234,35 +354,26 @@ def analyze(ticker: str):
                 "PEG": {"value": safe_num(peg), "meaning": "PE adjusted growth", "ideal": "Below 1 good"},
                 "ROE": {"value": safe_num(roe), "meaning": "Return on equity", "ideal": "Higher better"},
                 "ROCE": {"value": safe_num(roce), "meaning": "Return on capital", "ideal": "Higher better"},
-                "DebtEquity": {"value": safe_num(debt), "meaning": "Debt burden", "ideal": "Lower better"},
+                "DebtEquity": {"value": safe_num(debt_equity), "meaning": "Debt burden", "ideal": "Lower better"},
                 "CurrentRatio": {"value": safe_num(current_ratio), "meaning": "Liquidity", "ideal": "Above 1 good"},
-                "OperatingMargin": {"value": safe_num(opm), "meaning": "Operating profit %", "ideal": "Higher better"},
-                "NetMargin": {"value": safe_num(npm), "meaning": "Net profit %", "ideal": "Higher better"},
+                "OperatingMargin": {"value": safe_num(op_margin), "meaning": "Operating profit %", "ideal": "Higher better"},
+                "NetMargin": {"value": safe_num(net_margin), "meaning": "Net profit %", "ideal": "Higher better"},
                 "SalesGrowth": {"value": safe_num(sales_growth), "meaning": "Revenue growth %", "ideal": "Higher better"},
                 "ProfitGrowth": {"value": safe_num(profit_growth), "meaning": "Profit growth %", "ideal": "Higher better"},
                 "FCF": {"value": safe_num(fcf), "meaning": "Free cash flow", "ideal": "Positive good"},
                 "DividendYield": {"value": safe_num(divy), "meaning": "Dividend return", "ideal": "Moderate good"},
-                "InterestCoverage": {"value": safe_num(interest_cov), "meaning": "Pay interest ability", "ideal": "Higher better"},
+                "InterestCoverage": {"value": safe_num(interest_cov), "meaning": "Interest servicing ability", "ideal": "Higher better"},
                 "50 DMA": {"value": safe_num(dma50), "meaning": "50 day average", "ideal": "Price above positive"},
                 "200 DMA": {"value": safe_num(dma200), "meaning": "200 day average", "ideal": "Price above strong"},
             }
         }
 
-        CACHE[resolved] = {
+        CACHE[code] = {
             "time": time.time(),
             "data": data
         }
 
         return data
 
-    except Exception:
-        if ticker.upper() in CACHE:
-            cached = CACHE[ticker.upper()]
-            cached["data"]["fetch_time"] = datetime.now().strftime(
-                "%d-%b-%Y %I:%M %p"
-            )
-            return cached["data"]
-
-        return {
-            "error": "Temporary market data busy. Retry shortly."
-        }
+    except Exception as e:
+        return {"error": str(e)}
