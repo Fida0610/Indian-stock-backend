@@ -1,7 +1,7 @@
 # main.py
-# FINAL PRO VERSION
-# Raw-calculated ratios + stable Render hosting + cache
-# Replace your FULL existing main.py with this code
+# FINAL PERFECTED MAIN.PY V2
+# Stable Render + Raw Calculated Ratios + Smart Debt/Equity Detection
+# Replace FULL existing main.py with this code
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +10,7 @@ import yfinance as yf
 import math
 import time
 
-app = FastAPI(title="Indian Stock Analyzer PRO")
+app = FastAPI(title="Indian Stock Analyzer PRO V2")
 
 # ---------------------------------------------------
 # CORS
@@ -55,11 +55,11 @@ def safe_num(v, digits=2):
         return "N/A"
 
 
-def pct(numerator, denominator):
+def pct(a, b):
     try:
-        if denominator == 0:
+        if b == 0:
             return 0
-        return (numerator / denominator) * 100
+        return (a / b) * 100
     except:
         return 0
 
@@ -96,7 +96,7 @@ def resolve_symbol(txt):
 # ---------------------------------------------------
 # SCORE ENGINE
 # ---------------------------------------------------
-def get_score(pe, pb, roe, debt, current_ratio):
+def get_score(pe, pb, roe, debt_equity, current_ratio):
     score = 0
     reasons = []
 
@@ -112,9 +112,9 @@ def get_score(pe, pb, roe, debt, current_ratio):
         score += 2
         reasons.append("Strong ROE")
 
-    if debt > 0 and debt < 100:
+    if debt_equity > 0 and debt_equity < 1:
         score += 2
-        reasons.append("Manageable debt")
+        reasons.append("Low debt")
 
     if current_ratio > 1:
         score += 1
@@ -138,7 +138,7 @@ def get_score(pe, pb, roe, debt, current_ratio):
 # ---------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "Indian Stock Analyzer PRO Running"}
+    return {"message": "Indian Stock Analyzer PRO V2 Running"}
 
 
 @app.get("/health")
@@ -168,7 +168,7 @@ def analyze(ticker: str):
         stock = yf.Ticker(symbol)
 
         # ---------------------------------------------------
-        # PRICE HISTORY
+        # PRICE DATA
         # ---------------------------------------------------
         hist = stock.history(period="1y")
 
@@ -185,23 +185,22 @@ def analyze(ticker: str):
         dma200 = float(close.tail(200).mean()) if len(close) >= 200 else price
 
         # ---------------------------------------------------
-        # RAW FINANCIALS
+        # RAW FINANCIAL DATA
         # ---------------------------------------------------
         fin = stock.financials
         bs = stock.balance_sheet
         cf = stock.cashflow
 
-        # Income Statement
-        revenue = 0
-        net_income = 0
-        ebit = 0
-        interest_exp = 0
+        revenue = net_income = ebit = interest_exp = 0
+        equity = debt = current_assets = current_liabilities = total_assets = 0
+        operating_cf = capex = 0
 
+        # ---------------- Income Statement ----------------
         try:
             for idx in fin.index:
                 n = str(idx).lower()
 
-                if "total revenue" in n:
+                if "revenue" in n:
                     revenue = first(fin.loc[idx])
 
                 if "net income" in n:
@@ -215,20 +214,20 @@ def analyze(ticker: str):
         except:
             pass
 
-        # Balance Sheet
-        equity = 0
-        debt = 0
-        current_assets = 0
-        current_liabilities = 0
-        total_assets = 0
-
+        # ---------------- Balance Sheet ----------------
         try:
             for idx in bs.index:
                 n = str(idx).lower()
 
-                if "stockholders equity" in n or "total equity" in n:
+                # Equity
+                if (
+                    "stockholders equity" in n
+                    or "total equity" in n
+                    or "shareholders equity" in n
+                ):
                     equity = first(bs.loc[idx])
 
+                # Assets / Liabilities
                 if "current assets" in n:
                     current_assets = first(bs.loc[idx])
 
@@ -238,15 +237,21 @@ def analyze(ticker: str):
                 if "total assets" in n:
                     total_assets = first(bs.loc[idx])
 
-                if "total debt" in n or "long term debt" in n:
-                    debt = first(bs.loc[idx])
+                # Smart Debt Detection
+                if (
+                    "total debt" in n
+                    or "long term debt" in n
+                    or "current debt" in n
+                    or "borrowings" in n
+                    or "lease obligation" in n
+                    or "short term debt" in n
+                ):
+                    debt += first(bs.loc[idx])
+
         except:
             pass
 
-        # Cash Flow
-        operating_cf = 0
-        capex = 0
-
+        # ---------------- Cash Flow ----------------
         try:
             for idx in cf.index:
                 n = str(idx).lower()
@@ -260,10 +265,9 @@ def analyze(ticker: str):
             pass
 
         # ---------------------------------------------------
-        # SHARES OUTSTANDING / MARKET FIELDS
+        # EXTRA INFO
         # ---------------------------------------------------
-        shares = 0
-        divy = 0
+        shares = divy = 0
 
         try:
             info = stock.info
@@ -275,15 +279,15 @@ def analyze(ticker: str):
         # ---------------------------------------------------
         # RAW CALCULATED RATIOS
         # ---------------------------------------------------
-        eps = shares and (net_income / shares) or 0
-        book_value_ps = shares and (equity / shares) or 0
+        eps = (net_income / shares) if shares > 0 else 0
+        book_value_ps = (equity / shares) if shares > 0 else 0
 
-        pe = price / eps if eps > 0 else 0
-        pb = price / book_value_ps if book_value_ps > 0 else 0
+        pe = (price / eps) if eps > 0 else 0
+        pb = (price / book_value_ps) if book_value_ps > 0 else 0
 
         roe = pct(net_income, equity)
         roce = pct(ebit, (total_assets - current_liabilities))
-        debt_equity = debt / equity if equity > 0 else 0
+        debt_equity = (debt / equity) if equity > 0 else 0
         current_ratio = (
             current_assets / current_liabilities
             if current_liabilities > 0 else 0
@@ -299,15 +303,16 @@ def analyze(ticker: str):
             if interest_exp > 0 else 0
         )
 
-        # Growth (using yearly comparison if available)
-        sales_growth = 0
-        profit_growth = 0
+        # Growth
+        sales_growth = profit_growth = 0
 
         try:
             if fin.shape[1] >= 2:
                 rev_now = revenue
-                rev_prev = first(fin.loc["Total Revenue"].iloc[1:2])
-                ni_prev = first(fin.loc["Net Income"].iloc[1:2])
+                rev_prev = first(fin.iloc[:, 1])
+
+                ni_now = net_income
+                ni_prev = first(fin.iloc[:, 1])
 
                 sales_growth = pct(
                     rev_now - rev_prev,
@@ -315,7 +320,7 @@ def analyze(ticker: str):
                 )
 
                 profit_growth = pct(
-                    net_income - ni_prev,
+                    ni_now - ni_prev,
                     ni_prev
                 )
         except:
