@@ -1,6 +1,7 @@
 # main.py
-# RATE LIMIT SAFE + CACHE FIX VERSION
-# Replace FULL main.py with this code
+# ULTRA STABLE RENDER VERSION
+# Uses lightweight calls (history + fast_info style fallback)
+# Replace FULL existing main.py with this code
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,10 +24,10 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------
-# CACHE SETTINGS
+# CACHE
 # ---------------------------------------------------
 CACHE = {}
-CACHE_SECONDS = 600   # 10 minutes
+CACHE_SECONDS = 600   # 10 min
 
 
 # ---------------------------------------------------
@@ -54,7 +55,7 @@ def safe_num(v, digits=2):
         return "N/A"
 
 
-def percent(v):
+def pct(v):
     val = to_float(v)
     if val != 0 and abs(val) < 1:
         return val * 100
@@ -84,27 +85,23 @@ def resolve_symbol(user_input):
 
 
 # ---------------------------------------------------
-# SCORE ENGINE
+# SCORE
 # ---------------------------------------------------
-def verdict_engine(pe, pb, roe, debt):
+def get_score(pe, pb, roe):
     score = 0
     reasons = []
 
     if pe > 0 and pe < 25:
-        score += 2
+        score += 3
         reasons.append("Fair valuation")
 
     if pb > 0 and pb < 5:
-        score += 1
-        reasons.append("Reasonable PB ratio")
+        score += 2
+        reasons.append("Reasonable PB")
 
     if roe > 15:
-        score += 2
+        score += 3
         reasons.append("Strong ROE")
-
-    if debt > 0 and debt < 100:
-        score += 2
-        reasons.append("Manageable debt")
 
     if score >= 6:
         verdict = "BUY 🟢"
@@ -114,7 +111,7 @@ def verdict_engine(pe, pb, roe, debt):
         horizon = "1 to 3 Years"
     else:
         verdict = "AVOID 🔴"
-        horizon = "Weak fundamentals"
+        horizon = "Wait"
 
     return score, verdict, horizon, reasons
 
@@ -137,12 +134,11 @@ def health():
 # ---------------------------------------------------
 @app.get("/analyze")
 def analyze(ticker: str):
+
     try:
         resolved = resolve_symbol(ticker)
 
-        # ---------------------------------------------------
-        # CACHE HIT
-        # ---------------------------------------------------
+        # CACHE FIRST
         if resolved in CACHE:
             cached = CACHE[resolved]
 
@@ -156,37 +152,44 @@ def analyze(ticker: str):
 
         stock = yf.Ticker(symbol)
 
-        # Lightweight calls only
-        info = stock.info
+        # ---------------------------------------------------
+        # ONLY HISTORY CALL (MOST STABLE)
+        # ---------------------------------------------------
+        hist = stock.history(period="1y", auto_adjust=False)
 
-        price = to_float(
-            info.get("currentPrice")
-            or info.get("regularMarketPrice")
-        )
+        if hist.empty:
+            return {"error": "No market data found"}
 
-        pe = to_float(info.get("trailingPE"))
-        pb = to_float(info.get("priceToBook"))
-        roe = percent(info.get("returnOnEquity"))
-        debt = to_float(info.get("debtToEquity"))
-        divy = percent(info.get("dividendYield"))
+        close = hist["Close"]
 
-        current_ratio = to_float(info.get("currentRatio"))
-        opm = percent(info.get("operatingMargins"))
-        npm = percent(info.get("profitMargins"))
-        sales_growth = percent(info.get("revenueGrowth"))
-        profit_growth = percent(info.get("earningsGrowth"))
-        peg = to_float(info.get("pegRatio"))
-        fcf = to_float(info.get("freeCashflow"))
+        price = float(close.iloc[-1])
+        high_52 = float(close.max())
+        low_52 = float(close.min())
 
-        if peg == 0 and pe > 0 and profit_growth > 0:
-            peg = pe / profit_growth
+        dma50 = float(close.tail(50).mean()) if len(close) >= 50 else price
+        dma200 = float(close.tail(200).mean()) if len(close) >= 200 else price
 
-        interest_cov = percent(info.get("ebitdaMargins"))
-        roce = roe
+        # ---------------------------------------------------
+        # LIGHT INFO CALL (OPTIONAL)
+        # ---------------------------------------------------
+        pe = pb = roe = divy = 0
 
-        score, verdict, horizon, reasons = verdict_engine(
-            pe, pb, roe, debt
-        )
+        try:
+            info = stock.fast_info
+            # fast_info limited fields
+        except:
+            pass
+
+        try:
+            info2 = stock.info
+            pe = to_float(info2.get("trailingPE"))
+            pb = to_float(info2.get("priceToBook"))
+            roe = pct(info2.get("returnOnEquity"))
+            divy = pct(info2.get("dividendYield"))
+        except:
+            pass
+
+        score, verdict, horizon, reasons = get_score(pe, pb, roe)
 
         data = {
             "stock": resolved,
@@ -201,8 +204,9 @@ def analyze(ticker: str):
                 "PE Ratio": safe_num(pe),
                 "PB Ratio": safe_num(pb),
                 "ROE": safe_num(roe),
-                "Debt to Equity": safe_num(debt),
-                "Dividend Yield": safe_num(divy)
+                "Dividend Yield": safe_num(divy),
+                "52W High": safe_num(high_52),
+                "52W Low": safe_num(low_52),
             },
 
             "ratios": {
@@ -211,70 +215,34 @@ def analyze(ticker: str):
                     "meaning": "Price vs book value",
                     "ideal": "Lower better"
                 },
-                "PEG": {
-                    "value": safe_num(peg),
-                    "meaning": "PE adjusted for growth",
-                    "ideal": "Below 1 good"
+                "PE Ratio": {
+                    "value": safe_num(pe),
+                    "meaning": "Price vs earnings",
+                    "ideal": "Moderate lower better"
                 },
                 "ROE": {
                     "value": safe_num(roe),
                     "meaning": "Return on shareholder money",
                     "ideal": "Higher better"
                 },
-                "ROCE": {
-                    "value": safe_num(roce),
-                    "meaning": "Return on capital employed",
-                    "ideal": "Higher better"
-                },
-                "DebtEquity": {
-                    "value": safe_num(debt),
-                    "meaning": "Debt burden",
-                    "ideal": "Lower better"
-                },
-                "CurrentRatio": {
-                    "value": safe_num(current_ratio),
-                    "meaning": "Liquidity strength",
-                    "ideal": "Above 1 good"
-                },
-                "OperatingMargin": {
-                    "value": safe_num(opm),
-                    "meaning": "Operating profit %",
-                    "ideal": "Higher better"
-                },
-                "NetMargin": {
-                    "value": safe_num(npm),
-                    "meaning": "Net profit %",
-                    "ideal": "Higher better"
-                },
-                "SalesGrowth": {
-                    "value": safe_num(sales_growth),
-                    "meaning": "Revenue growth %",
-                    "ideal": "Higher sustainable better"
-                },
-                "ProfitGrowth": {
-                    "value": safe_num(profit_growth),
-                    "meaning": "Profit growth %",
-                    "ideal": "Higher better"
-                },
-                "FCF": {
-                    "value": safe_num(fcf),
-                    "meaning": "Free cash flow",
-                    "ideal": "Positive good"
-                },
                 "DividendYield": {
                     "value": safe_num(divy),
-                    "meaning": "Dividend yield %",
+                    "meaning": "Dividend return %",
                     "ideal": "Moderate/high good"
                 },
-                "InterestCoverage": {
-                    "value": safe_num(interest_cov),
-                    "meaning": "Ability to pay interest",
-                    "ideal": "Higher better"
+                "50 DMA": {
+                    "value": safe_num(dma50),
+                    "meaning": "50 day average price",
+                    "ideal": "Price above is positive"
+                },
+                "200 DMA": {
+                    "value": safe_num(dma200),
+                    "meaning": "200 day average price",
+                    "ideal": "Price above is strong trend"
                 }
             }
         }
 
-        # SAVE TO CACHE
         CACHE[resolved] = {
             "time": time.time(),
             "data": data
@@ -291,5 +259,5 @@ def analyze(ticker: str):
             return cached["data"]
 
         return {
-            "error": "Temporary data source busy. Please retry in 1 minute."
+            "error": "Temporary market data busy. Retry shortly."
         }
