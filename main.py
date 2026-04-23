@@ -1,6 +1,6 @@
 # main.py
-# ULTRA STABLE RENDER VERSION
-# Uses lightweight calls (history + fast_info style fallback)
+# FINAL HYBRID RENDER VERSION
+# Stable + All Ratios (N/A if unavailable)
 # Replace FULL existing main.py with this code
 
 from fastapi import FastAPI
@@ -85,23 +85,27 @@ def resolve_symbol(user_input):
 
 
 # ---------------------------------------------------
-# SCORE
+# SCORE ENGINE
 # ---------------------------------------------------
-def get_score(pe, pb, roe):
+def score_engine(pe, pb, roe, debt):
     score = 0
     reasons = []
 
     if pe > 0 and pe < 25:
-        score += 3
+        score += 2
         reasons.append("Fair valuation")
 
     if pb > 0 and pb < 5:
-        score += 2
+        score += 1
         reasons.append("Reasonable PB")
 
     if roe > 15:
-        score += 3
+        score += 2
         reasons.append("Strong ROE")
+
+    if debt > 0 and debt < 100:
+        score += 2
+        reasons.append("Manageable debt")
 
     if score >= 6:
         verdict = "BUY 🟢"
@@ -138,7 +142,7 @@ def analyze(ticker: str):
     try:
         resolved = resolve_symbol(ticker)
 
-        # CACHE FIRST
+        # CACHE
         if resolved in CACHE:
             cached = CACHE[resolved]
 
@@ -149,11 +153,10 @@ def analyze(ticker: str):
                 return cached["data"]
 
         symbol = resolved + ".NS"
-
         stock = yf.Ticker(symbol)
 
         # ---------------------------------------------------
-        # ONLY HISTORY CALL (MOST STABLE)
+        # STABLE PRICE HISTORY
         # ---------------------------------------------------
         hist = stock.history(period="1y", auto_adjust=False)
 
@@ -170,26 +173,42 @@ def analyze(ticker: str):
         dma200 = float(close.tail(200).mean()) if len(close) >= 200 else price
 
         # ---------------------------------------------------
-        # LIGHT INFO CALL (OPTIONAL)
+        # OPTIONAL INFO (may fail, still app works)
         # ---------------------------------------------------
-        pe = pb = roe = divy = 0
+        pe = pb = roe = debt = divy = 0
+        current_ratio = opm = npm = sales_growth = 0
+        profit_growth = peg = fcf = interest_cov = 0
 
         try:
-            info = stock.fast_info
-            # fast_info limited fields
+            info = stock.info
+
+            pe = to_float(info.get("trailingPE"))
+            pb = to_float(info.get("priceToBook"))
+            roe = pct(info.get("returnOnEquity"))
+            debt = to_float(info.get("debtToEquity"))
+            divy = pct(info.get("dividendYield"))
+
+            current_ratio = to_float(info.get("currentRatio"))
+            opm = pct(info.get("operatingMargins"))
+            npm = pct(info.get("profitMargins"))
+            sales_growth = pct(info.get("revenueGrowth"))
+            profit_growth = pct(info.get("earningsGrowth"))
+            peg = to_float(info.get("pegRatio"))
+            fcf = to_float(info.get("freeCashflow"))
+            interest_cov = pct(info.get("ebitdaMargins"))
+
         except:
             pass
 
-        try:
-            info2 = stock.info
-            pe = to_float(info2.get("trailingPE"))
-            pb = to_float(info2.get("priceToBook"))
-            roe = pct(info2.get("returnOnEquity"))
-            divy = pct(info2.get("dividendYield"))
-        except:
-            pass
+        roce = roe
 
-        score, verdict, horizon, reasons = get_score(pe, pb, roe)
+        # Manual PEG
+        if peg == 0 and pe > 0 and profit_growth > 0:
+            peg = pe / profit_growth
+
+        score, verdict, horizon, reasons = score_engine(
+            pe, pb, roe, debt
+        )
 
         data = {
             "stock": resolved,
@@ -204,42 +223,28 @@ def analyze(ticker: str):
                 "PE Ratio": safe_num(pe),
                 "PB Ratio": safe_num(pb),
                 "ROE": safe_num(roe),
+                "Debt to Equity": safe_num(debt),
                 "Dividend Yield": safe_num(divy),
                 "52W High": safe_num(high_52),
                 "52W Low": safe_num(low_52),
             },
 
             "ratios": {
-                "PB Ratio": {
-                    "value": safe_num(pb),
-                    "meaning": "Price vs book value",
-                    "ideal": "Lower better"
-                },
-                "PE Ratio": {
-                    "value": safe_num(pe),
-                    "meaning": "Price vs earnings",
-                    "ideal": "Moderate lower better"
-                },
-                "ROE": {
-                    "value": safe_num(roe),
-                    "meaning": "Return on shareholder money",
-                    "ideal": "Higher better"
-                },
-                "DividendYield": {
-                    "value": safe_num(divy),
-                    "meaning": "Dividend return %",
-                    "ideal": "Moderate/high good"
-                },
-                "50 DMA": {
-                    "value": safe_num(dma50),
-                    "meaning": "50 day average price",
-                    "ideal": "Price above is positive"
-                },
-                "200 DMA": {
-                    "value": safe_num(dma200),
-                    "meaning": "200 day average price",
-                    "ideal": "Price above is strong trend"
-                }
+                "PB Ratio": {"value": safe_num(pb), "meaning": "Price vs book", "ideal": "Lower better"},
+                "PEG": {"value": safe_num(peg), "meaning": "PE adjusted growth", "ideal": "Below 1 good"},
+                "ROE": {"value": safe_num(roe), "meaning": "Return on equity", "ideal": "Higher better"},
+                "ROCE": {"value": safe_num(roce), "meaning": "Return on capital", "ideal": "Higher better"},
+                "DebtEquity": {"value": safe_num(debt), "meaning": "Debt burden", "ideal": "Lower better"},
+                "CurrentRatio": {"value": safe_num(current_ratio), "meaning": "Liquidity", "ideal": "Above 1 good"},
+                "OperatingMargin": {"value": safe_num(opm), "meaning": "Operating profit %", "ideal": "Higher better"},
+                "NetMargin": {"value": safe_num(npm), "meaning": "Net profit %", "ideal": "Higher better"},
+                "SalesGrowth": {"value": safe_num(sales_growth), "meaning": "Revenue growth %", "ideal": "Higher better"},
+                "ProfitGrowth": {"value": safe_num(profit_growth), "meaning": "Profit growth %", "ideal": "Higher better"},
+                "FCF": {"value": safe_num(fcf), "meaning": "Free cash flow", "ideal": "Positive good"},
+                "DividendYield": {"value": safe_num(divy), "meaning": "Dividend return", "ideal": "Moderate good"},
+                "InterestCoverage": {"value": safe_num(interest_cov), "meaning": "Pay interest ability", "ideal": "Higher better"},
+                "50 DMA": {"value": safe_num(dma50), "meaning": "50 day average", "ideal": "Price above positive"},
+                "200 DMA": {"value": safe_num(dma200), "meaning": "200 day average", "ideal": "Price above strong"},
             }
         }
 
