@@ -1,21 +1,10 @@
-# main.py
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from supabase import create_client
 import yfinance as yf
 import time
-from datetime import datetime
 import math
 
-# ---------------------------------------------------
-# APP
-# ---------------------------------------------------
 app = FastAPI()
-
-@app.get("/")
-def root():
-    return {"message": "Track VERSION LOADED"}
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,36 +14,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------
-# SUPABASE CONFIG
-# ---------------------------------------------------
-SUPABASE_URL = "https://zljjmbutcsqyxlcjkfsd.supabase.co/rest/v1/"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpsamptYnV0Y3NxeXhsY2prZnNkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0NDI4NTUsImV4cCI6MjA5MzAxODg1NX0.U_2wnyiJxPywvSk8H5piAoRqpQ2Vm2EPkvLgGRmq8_U"
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ---------------------------------------------------
-# NIFTY LIST (extend later)
-# ---------------------------------------------------
-NIFTY150 = [
-    "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
-    "LT", "SBIN", "ITC", "HINDUNILVR", "KOTAKBANK"
-]
-
-# ---------------------------------------------------
-# HELPERS
-# ---------------------------------------------------
-def safe(v):
-    try:
-        if v is None or (isinstance(v, float) and math.isnan(v)):
-            return None
-        return float(v)
-    except:
-        return None
+# ---------------- HELPERS ----------------
 
 def pct(a, b):
     try:
-        if b == 0 or b is None:
+        if not a or not b:
             return None
         return (a / b) * 100
     except:
@@ -66,259 +30,156 @@ def get_latest(series):
     except:
         return None
 
-# ---------------------------------------------------
-# ANALYZE STOCK
-# ---------------------------------------------------
-def analyze_stock(symbol):
+# ---------------- ANALYZE ----------------
+
+@app.get("/analyze")
+def analyze(ticker: str):
 
     try:
-        stock = yf.Ticker(symbol + ".NS")
+        stock = yf.Ticker(ticker + ".NS")
 
         hist = stock.history(period="1y")
         if hist.empty:
-            return None
+            return {"error": "No price data"}
 
         price = float(hist["Close"].iloc[-1])
-        dma50 = float(hist["Close"].tail(50).mean())
         dma200 = float(hist["Close"].tail(200).mean())
 
         fin = stock.financials
         bs = stock.balance_sheet
         cf = stock.cashflow
 
-        revenue = net_income = ebit = 0
-        equity = debt = 0
+        net_income = ebit = equity = debt = 0
         current_assets = current_liabilities = total_assets = 0
         op_cf = capex = 0
 
-        # Income
         for idx in fin.index:
             n = str(idx).lower()
-            if "revenue" in n:
-                revenue = get_latest(fin.loc[idx])
             if "net income" in n:
                 net_income = get_latest(fin.loc[idx])
             if "ebit" in n:
                 ebit = get_latest(fin.loc[idx])
 
-        # Balance
         for idx in bs.index:
             n = str(idx).lower()
-
             if "equity" in n:
                 equity = get_latest(bs.loc[idx])
-
             if "current assets" in n:
                 current_assets = get_latest(bs.loc[idx])
-
             if "current liabilities" in n:
                 current_liabilities = get_latest(bs.loc[idx])
-
             if "total assets" in n:
                 total_assets = get_latest(bs.loc[idx])
-
             if "debt" in n or "borrowings" in n:
                 d = get_latest(bs.loc[idx])
                 if d:
                     debt += d
 
-        # Cashflow
         for idx in cf.index:
             n = str(idx).lower()
-
             if "operating cash flow" in n:
                 op_cf = get_latest(cf.loc[idx])
-
             if "capital expenditure" in n:
                 capex = abs(get_latest(cf.loc[idx]))
 
-        # Ratios
         roe = pct(net_income, equity)
         roce = pct(ebit, (total_assets - current_liabilities))
         debt_equity = debt / equity if equity else None
-        current_ratio = (
-            current_assets / current_liabilities
-            if current_liabilities else None
-        )
+        current_ratio = current_assets / current_liabilities if current_liabilities else None
         fcf = op_cf - capex if op_cf else None
 
-        # Growth fallback (stable default)
-        sales_growth = 12
-        profit_growth = 12
+        score = 0
+        if roe and roe > 15: score += 2
+        if roce and roce > 18: score += 2
+        if debt_equity is not None and debt_equity < 0.5: score += 2
+        if current_ratio and current_ratio > 1.5: score += 1
+        if fcf and fcf > 0: score += 1
+        if price > dma200: score += 2
 
-        # ---------------- SCORING ----------------
-        def wealth():
-            score = 0
-            if roe and roe > 15: score += 2
-            if roce and roce > 18: score += 2
-            if debt_equity is not None and debt_equity < 0.5: score += 2
-            if sales_growth > 10: score += 1
-            if profit_growth > 10: score += 1
-            if fcf and fcf > 0: score += 1
-            if current_ratio and current_ratio > 1.5: score += 1
-            return score
-
-        def multibagger():
-            score = 0
-            if sales_growth > 20: score += 2
-            if profit_growth > 25: score += 2
-            if roce and roce > 20: score += 2
-            if debt_equity is not None and debt_equity < 0.3: score += 2
-            if price > dma200: score += 1
-            return score
-
-        def balanced():
-            score = 0
-            if roce and roce > 18: score += 2
-            if debt_equity is not None and debt_equity < 0.4: score += 2
-            if sales_growth > 15: score += 2
-            if profit_growth > 15: score += 2
-            if current_ratio and current_ratio > 1.2: score += 1
-            return score
+        if score >= 8:
+            verdict = "BUY 🟢"
+        elif score >= 5:
+            verdict = "HOLD 🟡"
+        else:
+            verdict = "AVOID 🔴"
 
         return {
-            "stock": symbol,
-            "metrics": {
-                "roe": roe,
-                "roce": roce,
-                "debt": debt_equity,
-                "fcf": fcf,
-                "current_ratio": current_ratio
-            },
-            "wealth": wealth(),
-            "multibagger": multibagger(),
-            "balanced": balanced()
+            "stock": ticker.upper(),
+            "score": score,
+            "verdict": verdict,
+            "ratios": {
+                "ROE": roe,
+                "ROCE": roce,
+                "Debt": debt_equity,
+                "CurrentRatio": current_ratio,
+                "FCF": fcf
+            }
         }
 
-    except:
-        return None
+    except Exception as e:
+        return {"error": str(e)}
 
-# ---------------------------------------------------
-# STORE SNAPSHOT (PERMANENT)
-# ---------------------------------------------------
-def store_snapshot(symbol, metrics):
+# ---------------- SCREENER ----------------
 
-    today = datetime.now().strftime("%Y-%m-%d")
+NIFTY50 = [
+    "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK",
+    "LT","SBIN","ITC","HINDUNILVR","KOTAKBANK",
+    "AXISBANK","ASIANPAINT","BAJFINANCE","MARUTI",
+    "SUNPHARMA","TITAN","ULTRACEMCO","WIPRO"
+]
 
-    existing = supabase.table("stock_history")\
-        .select("*")\
-        .eq("ticker", symbol)\
-        .eq("date", today)\
-        .execute()
+def calc_score(r, t):
+    roe, roce, debt, cr, fcf = r["ROE"], r["ROCE"], r["Debt"], r["CurrentRatio"], r["FCF"]
+    s = 0
 
-    if existing.data:
-        return
+    if t == "wealth":
+        if roe and roe > 15: s += 2
+        if roce and roce > 18: s += 2
+        if debt is not None and debt < 0.5: s += 2
+        if cr and cr > 1.5: s += 1
+        if fcf and fcf > 0: s += 1
 
-    supabase.table("stock_history").insert({
-        "ticker": symbol,
-        "date": today,
-        "roe": metrics.get("roe"),
-        "roce": metrics.get("roce"),
-        "debt": metrics.get("debt"),
-        "fcf": metrics.get("fcf"),
-        "current_ratio": metrics.get("current_ratio")
-    }).execute()
+    elif t == "multibagger":
+        if roe and roe > 18: s += 2
+        if roce and roce > 20: s += 2
+        if debt is not None and debt < 0.3: s += 2
+        if fcf and fcf > 0: s += 1
 
-# ---------------------------------------------------
-# TRACK DAILY
-# ---------------------------------------------------
-@app.get("/track")
-def track():
+    elif t == "balanced":
+        if roe and roe > 15: s += 2
+        if roce and roce > 18: s += 2
+        if debt is not None and debt < 0.4: s += 2
+        if cr and cr > 1.2: s += 1
 
-    for stock in NIFTY150:
+    return s
 
-        data = analyze_stock(stock)
-        if not data:
-            continue
+def verdict_fn(s):
+    if s >= 7: return "BUY 🟢"
+    elif s >= 4: return "HOLD 🟡"
+    else: return "AVOID 🔴"
 
-        store_snapshot(stock, data["metrics"])
-        time.sleep(1)
-
-    return {"status": "Tracked successfully"}
-
-# ---------------------------------------------------
-# COMPARE
-# ---------------------------------------------------
-def compare_logic(prev, curr):
-
-    score = 0
-
-    if curr["roe"] and prev["roe"]:
-        score += 1 if curr["roe"] > prev["roe"] else -1
-
-    if curr["debt"] and prev["debt"]:
-        score += 1 if curr["debt"] < prev["debt"] else -1
-
-    if curr["fcf"] and prev["fcf"]:
-        score += 1 if curr["fcf"] > prev["fcf"] else -1
-
-    if curr["current_ratio"] and prev["current_ratio"]:
-        score += 1 if curr["current_ratio"] > prev["current_ratio"] else -1
-
-    if score >= 2:
-        return "BUY 🟢"
-    elif score <= -2:
-        return "SELL 🔴"
-    else:
-        return "HOLD 🟡"
-
-@app.get("/compare")
-def compare(ticker: str):
-
-    ticker = ticker.upper()
-
-    res = supabase.table("stock_history")\
-        .select("*")\
-        .eq("ticker", ticker)\
-        .order("date", desc=True)\
-        .limit(2)\
-        .execute()
-
-    if len(res.data) < 2:
-        return {"message": "Not enough data"}
-
-    curr = res.data[0]
-    prev = res.data[1]
-
-    signal = compare_logic(prev, curr)
-
-    return {
-        "stock": ticker,
-        "previous": prev,
-        "current": curr,
-        "signal": signal
-    }
-
-# ---------------------------------------------------
-# SCREENER
-# ---------------------------------------------------
 @app.get("/screener")
-def screener():
+def screener(type: str):
 
-    results = {
-        "wealth": [],
-        "multibagger": [],
-        "balanced": []
-    }
+    res = []
 
-    for stock in NIFTY150:
+    for stock in NIFTY50:
+        try:
+            d = analyze(stock)
+            if "ratios" not in d:
+                continue
 
-        data = analyze_stock(stock)
-        if not data:
+            s = calc_score(d["ratios"], type)
+
+            res.append({
+                "stock": stock,
+                "score": s,
+                "verdict": verdict_fn(s)
+            })
+
+            time.sleep(1)
+
+        except:
             continue
 
-        if data["wealth"] >= 7:
-            results["wealth"].append(data)
-
-        if data["multibagger"] >= 6:
-            results["multibagger"].append(data)
-
-        if data["balanced"] >= 6:
-            results["balanced"].append(data)
-
-        time.sleep(1)
-
-    return {
-        "updated": datetime.now().strftime("%d-%b %H:%M"),
-        "results": results
-    }
+    return {"stocks": sorted(res, key=lambda x: x["score"], reverse=True)}
