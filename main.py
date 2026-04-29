@@ -13,6 +13,10 @@ import math
 # ---------------------------------------------------
 app = FastAPI()
 
+@app.get("/")
+def root():
+    return {"message": "Track VERSION LOADED"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
