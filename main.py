@@ -1,18 +1,18 @@
 # main.py
-# FINAL MAIN.PY V3 (ZERO FIXED + STABLE + RAW CALCULATIONS)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+from supabase import create_client
 import yfinance as yf
-import math
 import time
-
-app = FastAPI(title="Indian Stock Analyzer FINAL V3")
+from datetime import datetime
+import math
 
 # ---------------------------------------------------
-# CORS
+# APP
 # ---------------------------------------------------
+app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,262 +22,299 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------
-# CACHE
+# SUPABASE CONFIG
 # ---------------------------------------------------
-CACHE = {}
-CACHE_SECONDS = 600
+SUPABASE_URL = "YOUR_URL"
+SUPABASE_KEY = "YOUR_KEY"
 
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ---------------------------------------------------
+# NIFTY LIST (extend later)
+# ---------------------------------------------------
+NIFTY150 = [
+    "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
+    "LT", "SBIN", "ITC", "HINDUNILVR", "KOTAKBANK"
+]
 
 # ---------------------------------------------------
 # HELPERS
 # ---------------------------------------------------
-def to_float(v):
+def safe(v):
     try:
-        if v is None:
-            return 0.0
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
         return float(v)
     except:
-        return 0.0
-
-
-def safe_num(v, digits=2, allow_zero=False):
-    try:
-        if v is None:
-            return "N/A"
-
-        if isinstance(v, float) and math.isnan(v):
-            return "N/A"
-
-        if float(v) == 0 and not allow_zero:
-            return "N/A"
-
-        return round(float(v), digits)
-    except:
-        return "N/A"
-
+        return None
 
 def pct(a, b):
     try:
-        if b == 0:
-            return 0
+        if b == 0 or b is None:
+            return None
         return (a / b) * 100
     except:
-        return 0
+        return None
 
-
-def first(series):
+def get_latest(series):
     try:
-        return to_float(series.iloc[0])
+        return float(series.iloc[0])
     except:
-        return 0
-
-
-# ---------------------------------------------------
-# SYMBOL
-# ---------------------------------------------------
-def resolve_symbol(txt):
-    raw = txt.strip().upper()
-    return raw.replace(" ", "")
-
+        return None
 
 # ---------------------------------------------------
-# SCORE
+# ANALYZE STOCK
 # ---------------------------------------------------
-def get_score(pe, pb, roe, debt_equity, current_ratio):
-    score = 0
-    reasons = []
-
-    if pe > 0 and pe < 25:
-        score += 2
-        reasons.append("Fair valuation")
-
-    if pb > 0 and pb < 5:
-        score += 1
-        reasons.append("Reasonable PB")
-
-    if roe > 15:
-        score += 2
-        reasons.append("Strong ROE")
-
-    if debt_equity >= 0 and debt_equity < 1:
-        score += 2
-        reasons.append("Low debt")
-
-    if current_ratio > 1:
-        score += 1
-        reasons.append("Healthy liquidity")
-
-    if score >= 7:
-        return score, "BUY 🟢", "3-5 Years", reasons
-    elif score >= 4:
-        return score, "HOLD 🟡", "1-3 Years", reasons
-    else:
-        return score, "AVOID 🔴", "Wait", reasons
-
-
-# ---------------------------------------------------
-# ROUTES
-# ---------------------------------------------------
-@app.get("/")
-def root():
-    return {"message": "API Running"}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# ---------------------------------------------------
-# ANALYZE
-# ---------------------------------------------------
-@app.get("/analyze")
-def analyze(ticker: str):
+def analyze_stock(symbol):
 
     try:
-        code = resolve_symbol(ticker)
+        stock = yf.Ticker(symbol + ".NS")
 
-        # CACHE
-        if code in CACHE:
-            c = CACHE[code]
-            if time.time() - c["time"] < CACHE_SECONDS:
-                c["data"]["fetch_time"] = datetime.now().strftime("%d-%b-%Y %I:%M %p")
-                return c["data"]
-
-        stock = yf.Ticker(code + ".NS")
-
-        # ---------------- PRICE ----------------
         hist = stock.history(period="1y")
-
         if hist.empty:
-            return {"error": "No data"}
+            return None
 
-        close = hist["Close"]
-        price = float(close.iloc[-1])
+        price = float(hist["Close"].iloc[-1])
+        dma50 = float(hist["Close"].tail(50).mean())
+        dma200 = float(hist["Close"].tail(200).mean())
 
-        # ---------------- RAW DATA ----------------
         fin = stock.financials
         bs = stock.balance_sheet
         cf = stock.cashflow
 
-        revenue = net_income = ebit = interest = 0
-        equity = debt = current_assets = current_liabilities = total_assets = 0
+        revenue = net_income = ebit = 0
+        equity = debt = 0
+        current_assets = current_liabilities = total_assets = 0
         op_cf = capex = 0
 
-        # INCOME
-        try:
-            for idx in fin.index:
-                n = str(idx).lower()
-                if "revenue" in n:
-                    revenue = first(fin.loc[idx])
-                if "net income" in n:
-                    net_income = first(fin.loc[idx])
-                if "ebit" in n:
-                    ebit = first(fin.loc[idx])
-                if "interest expense" in n:
-                    interest = abs(first(fin.loc[idx]))
-        except:
-            pass
+        # Income
+        for idx in fin.index:
+            n = str(idx).lower()
+            if "revenue" in n:
+                revenue = get_latest(fin.loc[idx])
+            if "net income" in n:
+                net_income = get_latest(fin.loc[idx])
+            if "ebit" in n:
+                ebit = get_latest(fin.loc[idx])
 
-        # BALANCE SHEET
-        try:
-            for idx in bs.index:
-                n = str(idx).lower()
+        # Balance
+        for idx in bs.index:
+            n = str(idx).lower()
 
-                if "equity" in n:
-                    equity = first(bs.loc[idx])
+            if "equity" in n:
+                equity = get_latest(bs.loc[idx])
 
-                if "current assets" in n:
-                    current_assets = first(bs.loc[idx])
+            if "current assets" in n:
+                current_assets = get_latest(bs.loc[idx])
 
-                if "current liabilities" in n:
-                    current_liabilities = first(bs.loc[idx])
+            if "current liabilities" in n:
+                current_liabilities = get_latest(bs.loc[idx])
 
-                if "total assets" in n:
-                    total_assets = first(bs.loc[idx])
+            if "total assets" in n:
+                total_assets = get_latest(bs.loc[idx])
 
-                if (
-                    "debt" in n
-                    or "borrowings" in n
-                    or "lease" in n
-                ):
-                    debt += first(bs.loc[idx])
-        except:
-            pass
+            if "debt" in n or "borrowings" in n:
+                d = get_latest(bs.loc[idx])
+                if d:
+                    debt += d
 
-        # CASH FLOW
-        try:
-            for idx in cf.index:
-                n = str(idx).lower()
-                if "operating cash flow" in n:
-                    op_cf = first(cf.loc[idx])
-                if "capital expenditure" in n:
-                    capex = abs(first(cf.loc[idx]))
-        except:
-            pass
+        # Cashflow
+        for idx in cf.index:
+            n = str(idx).lower()
 
-        # MARKET DATA
-        shares = 0
-        try:
-            info = stock.info
-            shares = to_float(info.get("sharesOutstanding"))
-        except:
-            pass
+            if "operating cash flow" in n:
+                op_cf = get_latest(cf.loc[idx])
 
-        # ---------------- RATIOS ----------------
-        eps = net_income / shares if shares else 0
-        book_ps = equity / shares if shares else 0
+            if "capital expenditure" in n:
+                capex = abs(get_latest(cf.loc[idx]))
 
-        pe = price / eps if eps > 0 else 0
-        pb = price / book_ps if book_ps > 0 else 0
-
+        # Ratios
         roe = pct(net_income, equity)
         roce = pct(ebit, (total_assets - current_liabilities))
-        debt_equity = debt / equity if equity else 0
-        current_ratio = current_assets / current_liabilities if current_liabilities else 0
-
-        op_margin = pct(ebit, revenue)
-        net_margin = pct(net_income, revenue)
-
-        fcf = op_cf - capex if op_cf else 0
-        interest_cov = ebit / interest if interest else 0
-
-        # SCORE
-        score, verdict, horizon, reasons = get_score(
-            pe, pb, roe, debt_equity, current_ratio
+        debt_equity = debt / equity if equity else None
+        current_ratio = (
+            current_assets / current_liabilities
+            if current_liabilities else None
         )
+        fcf = op_cf - capex if op_cf else None
 
-        data = {
-            "stock": code,
-            "fetch_time": datetime.now().strftime("%d-%b-%Y %I:%M %p"),
-            "score": score,
-            "verdict": verdict,
-            "horizon": horizon,
-            "reasons": reasons,
+        # Growth fallback (stable default)
+        sales_growth = 12
+        profit_growth = 12
 
-            "fundamentals": {
-                "Current Price": safe_num(price, allow_zero=True),
-                "PE Ratio": safe_num(pe),
-                "PB Ratio": safe_num(pb),
-                "ROE": safe_num(roe),
-                "Debt to Equity": safe_num(debt_equity, allow_zero=True),
+        # ---------------- SCORING ----------------
+        def wealth():
+            score = 0
+            if roe and roe > 15: score += 2
+            if roce and roce > 18: score += 2
+            if debt_equity is not None and debt_equity < 0.5: score += 2
+            if sales_growth > 10: score += 1
+            if profit_growth > 10: score += 1
+            if fcf and fcf > 0: score += 1
+            if current_ratio and current_ratio > 1.5: score += 1
+            return score
+
+        def multibagger():
+            score = 0
+            if sales_growth > 20: score += 2
+            if profit_growth > 25: score += 2
+            if roce and roce > 20: score += 2
+            if debt_equity is not None and debt_equity < 0.3: score += 2
+            if price > dma200: score += 1
+            return score
+
+        def balanced():
+            score = 0
+            if roce and roce > 18: score += 2
+            if debt_equity is not None and debt_equity < 0.4: score += 2
+            if sales_growth > 15: score += 2
+            if profit_growth > 15: score += 2
+            if current_ratio and current_ratio > 1.2: score += 1
+            return score
+
+        return {
+            "stock": symbol,
+            "metrics": {
+                "roe": roe,
+                "roce": roce,
+                "debt": debt_equity,
+                "fcf": fcf,
+                "current_ratio": current_ratio
             },
-
-            "ratios": {
-                "ROE": safe_num(roe),
-                "ROCE": safe_num(roce),
-                "DebtEquity": safe_num(debt_equity, allow_zero=True),
-                "CurrentRatio": safe_num(current_ratio),
-                "OperatingMargin": safe_num(op_margin),
-                "NetMargin": safe_num(net_margin),
-                "FCF": safe_num(fcf, allow_zero=True),
-                "InterestCoverage": safe_num(interest_cov),
-            }
+            "wealth": wealth(),
+            "multibagger": multibagger(),
+            "balanced": balanced()
         }
 
-        CACHE[code] = {"time": time.time(), "data": data}
+    except:
+        return None
 
-        return data
+# ---------------------------------------------------
+# STORE SNAPSHOT (PERMANENT)
+# ---------------------------------------------------
+def store_snapshot(symbol, metrics):
 
-    except Exception as e:
-        return {"error": str(e)}
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    existing = supabase.table("stock_history")\
+        .select("*")\
+        .eq("ticker", symbol)\
+        .eq("date", today)\
+        .execute()
+
+    if existing.data:
+        return
+
+    supabase.table("stock_history").insert({
+        "ticker": symbol,
+        "date": today,
+        "roe": metrics.get("roe"),
+        "roce": metrics.get("roce"),
+        "debt": metrics.get("debt"),
+        "fcf": metrics.get("fcf"),
+        "current_ratio": metrics.get("current_ratio")
+    }).execute()
+
+# ---------------------------------------------------
+# TRACK DAILY
+# ---------------------------------------------------
+@app.get("/track")
+def track():
+
+    for stock in NIFTY150:
+
+        data = analyze_stock(stock)
+        if not data:
+            continue
+
+        store_snapshot(stock, data["metrics"])
+        time.sleep(1)
+
+    return {"status": "Tracked successfully"}
+
+# ---------------------------------------------------
+# COMPARE
+# ---------------------------------------------------
+def compare_logic(prev, curr):
+
+    score = 0
+
+    if curr["roe"] and prev["roe"]:
+        score += 1 if curr["roe"] > prev["roe"] else -1
+
+    if curr["debt"] and prev["debt"]:
+        score += 1 if curr["debt"] < prev["debt"] else -1
+
+    if curr["fcf"] and prev["fcf"]:
+        score += 1 if curr["fcf"] > prev["fcf"] else -1
+
+    if curr["current_ratio"] and prev["current_ratio"]:
+        score += 1 if curr["current_ratio"] > prev["current_ratio"] else -1
+
+    if score >= 2:
+        return "BUY 🟢"
+    elif score <= -2:
+        return "SELL 🔴"
+    else:
+        return "HOLD 🟡"
+
+@app.get("/compare")
+def compare(ticker: str):
+
+    ticker = ticker.upper()
+
+    res = supabase.table("stock_history")\
+        .select("*")\
+        .eq("ticker", ticker)\
+        .order("date", desc=True)\
+        .limit(2)\
+        .execute()
+
+    if len(res.data) < 2:
+        return {"message": "Not enough data"}
+
+    curr = res.data[0]
+    prev = res.data[1]
+
+    signal = compare_logic(prev, curr)
+
+    return {
+        "stock": ticker,
+        "previous": prev,
+        "current": curr,
+        "signal": signal
+    }
+
+# ---------------------------------------------------
+# SCREENER
+# ---------------------------------------------------
+@app.get("/screener")
+def screener():
+
+    results = {
+        "wealth": [],
+        "multibagger": [],
+        "balanced": []
+    }
+
+    for stock in NIFTY150:
+
+        data = analyze_stock(stock)
+        if not data:
+            continue
+
+        if data["wealth"] >= 7:
+            results["wealth"].append(data)
+
+        if data["multibagger"] >= 6:
+            results["multibagger"].append(data)
+
+        if data["balanced"] >= 6:
+            results["balanced"].append(data)
+
+        time.sleep(1)
+
+    return {
+        "updated": datetime.now().strftime("%d-%b %H:%M"),
+        "results": results
+    }
