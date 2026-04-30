@@ -14,38 +14,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-cache = {}
-
-# -------- DEFINITIONS + IDEAL RANGES --------
-
-RATIO_INFO = {
-    "ROE": {"def": "Return on Equity", "ideal": "> 15%", "good": lambda x: x > 15},
-    "ROCE": {"def": "Return on Capital", "ideal": "> 18%", "good": lambda x: x > 18},
-    "Debt": {"def": "Debt to Equity", "ideal": "< 0.5", "good": lambda x: x < 0.5},
-    "CurrentRatio": {"def": "Liquidity", "ideal": "> 1.5", "good": lambda x: x > 1.5},
-    "PE": {"def": "Price to Earnings", "ideal": "< 25", "good": lambda x: x < 25},
-    "PB": {"def": "Price to Book", "ideal": "< 3", "good": lambda x: x < 3},
-    "Dividend": {"def": "Dividend Yield", "ideal": "> 1%", "good": lambda x: x > 1},
-}
-
-# -------- SAFE FUNCTIONS --------
+# ---------------- SAFE FUNCTIONS ----------------
 
 def safe_div(a, b):
     if a is None or b in [None, 0]:
         return None
     return a / b
 
-def safe_sub(a, b):
-    if a is None or b is None:
-        return None
-    return a - b
-
 def fetch(stock):
     for _ in range(3):
         try:
-            d = stock.history(period="1y")
-            if not d.empty:
-                return d
+            data = stock.history(period="1y")
+            if not data.empty:
+                return data
         except:
             pass
         time.sleep(2)
@@ -53,6 +34,8 @@ def fetch(stock):
 
 def get(df, keys):
     try:
+        if df is None or df.empty:
+            return None
         for idx in df.index:
             name = str(idx).lower()
             if any(k in name for k in keys):
@@ -61,126 +44,115 @@ def get(df, keys):
         pass
     return None
 
-# -------- MAIN API --------
+# ---------------- STOCK LIST ----------------
 
-@app.get("/analyze")
-def analyze(ticker: str):
+STOCKS = [
+"BAJFINANCE","RELIANCE","HDFCBANK","ICICIBANK","BHARTIARTL","ADANIENT",
+"AXISBANK","COALINDIA","INDIGO","ONGC","LT","INFY","M&M","SBIN",
+"TCS","MARUTI","TATASTEEL","SUNPHARMA","ITC","HINDALCO","ULTRACEMCO",
+"EICHERMOT","HCLTECH","POWERGRID","KOTAKBANK","WIPRO","NTPC",
+"BAJAJ-AUTO","TECHM","HINDUNILVR","DRREDDY","CIPLA","TITAN"
+]
 
-    ticker = ticker.upper()
+# ---------------- RATIO ENGINE ----------------
 
-    if ticker in cache:
-        return cache[ticker]
+def get_ratios(ticker):
 
-    try:
-        stock = yf.Ticker(ticker + ".NS")
+    stock = yf.Ticker(ticker + ".NS")
 
-        hist = fetch(stock)
-        if hist is None:
-            return {"error": "Data busy"}
+    hist = fetch(stock)
+    if hist is None:
+        return None
 
-        price = float(hist["Close"].iloc[-1])
-        dma200 = float(hist["Close"].tail(200).mean())
+    price = float(hist["Close"].iloc[-1])
+    dma50 = float(hist["Close"].tail(50).mean())
+    dma200 = float(hist["Close"].tail(200).mean())
 
-        fin = stock.financials
-        bs = stock.balance_sheet
+    fin = stock.financials
+    bs = stock.balance_sheet
 
-        net_income = get(fin, ["net income"])
-        ebit = get(fin, ["ebit"])
+    net_income = get(fin, ["net income"])
+    ebit = get(fin, ["ebit"])
 
-        equity = get(bs, ["equity"])
-        debt = get(bs, ["debt"])
-        total_assets = get(bs, ["total assets"])
-        current_liabilities = get(bs, ["current liabilities"])
+    equity = get(bs, ["equity"])
+    debt = get(bs, ["debt"])
+    total_assets = get(bs, ["total assets"])
+    current_assets = get(bs, ["current assets"])
+    current_liabilities = get(bs, ["current liabilities"])
 
-        # -------- RATIOS --------
+    roe = safe_div(net_income, equity)
+    roce = safe_div(ebit, (total_assets - current_liabilities) if total_assets and current_liabilities else None)
+    debt_eq = safe_div(debt, equity)
+    current_ratio = safe_div(current_assets, current_liabilities)
 
-        roe = safe_div(net_income, equity)
-        roce = safe_div(ebit, safe_sub(total_assets, current_liabilities))
-        debt_eq = safe_div(debt, equity)
+    info = stock.info
+    pe = info.get("trailingPE")
+    pb = info.get("priceToBook")
+    market_cap = info.get("marketCap")
 
-        pe = stock.info.get("trailingPE")
-        pb = stock.info.get("priceToBook")
-        dividend = stock.info.get("dividendYield")
+    return {
+        "price": price,
+        "dma50": dma50,
+        "dma200": dma200,
+        "roe": roe * 100 if roe else None,
+        "roce": roce * 100 if roce else None,
+        "debt": debt_eq,
+        "current_ratio": current_ratio,
+        "pe": pe,
+        "pb": pb,
+        "market_cap": market_cap
+    }
 
-        if dividend:
-            dividend *= 100
+# ---------------- SCREENERS ----------------
 
-        # -------- FORMAT --------
+@app.get("/screener")
+def screener(type: str):
 
-        def pct(x):
-            return round(x * 100, 2) if x else None
+    results = []
 
-        def num(x):
-            return round(x, 2) if x else None
+    for s in STOCKS:
 
-        ratios = {
-            "ROE": pct(roe),
-            "ROCE": pct(roce),
-            "Debt": num(debt_eq),
-            "PE": num(pe),
-            "PB": num(pb),
-            "Dividend": num(dividend),
-        }
+        data = get_ratios(s)
+        if data is None:
+            continue
 
-        # -------- SCORING /10 --------
+        try:
 
-        score = 0
-        max_score = 0
-        details = []
+            # -------- ALL ROUNDER --------
+            if type == "allrounder":
+                if (
+                    data["roe"] and data["roe"] > 15 and
+                    data["roce"] and data["roce"] > 18 and
+                    data["debt"] is not None and data["debt"] < 0.5 and
+                    data["current_ratio"] and data["current_ratio"] > 1.5 and
+                    data["pe"] and data["pe"] < 25 and
+                    data["price"] > data["dma200"] and
+                    data["price"] > data["dma50"]
+                ):
+                    results.append({"stock": s, "tag": "ALL-ROUNDER", "signal": "BUY 🟢"})
 
-        for k, v in ratios.items():
-            info = RATIO_INFO.get(k)
+            # -------- MULTIBAGGER --------
+            elif type == "multibagger":
+                if (
+                    data["roe"] and data["roe"] > 20 and
+                    data["roce"] and data["roce"] > 20 and
+                    data["debt"] is not None and data["debt"] < 0.3 and
+                    data["pe"] and data["pe"] < 30 and
+                    data["market_cap"] and data["market_cap"] > 500e7
+                ):
+                    results.append({"stock": s, "tag": "MULTIBAGGER", "signal": "BUY 🚀"})
 
-            if v is None or info is None:
-                continue
+            # -------- BLUECHIP --------
+            elif type == "bluechip":
+                if (
+                    data["market_cap"] and data["market_cap"] > 20000e7 and
+                    data["roe"] and data["roe"] > 15 and
+                    data["roce"] and data["roce"] > 18 and
+                    data["debt"] is not None and data["debt"] < 0.5
+                ):
+                    results.append({"stock": s, "tag": "BLUECHIP", "signal": "SAFE 🛡️"})
 
-            max_score += 1
-            good = info["good"](v)
+        except:
+            continue
 
-            if good:
-                score += 1
-
-            details.append({
-                "name": k,
-                "value": v,
-                "ideal": info["ideal"],
-                "definition": info["def"],
-                "status": "GOOD" if good else "BAD"
-            })
-
-        # -------- TECH --------
-        trend = price > dma200
-
-        if trend:
-            score += 1
-        max_score += 1
-
-        # -------- FINAL SCORE --------
-
-        final_score = round((score / max_score) * 10, 1) if max_score else 0
-
-        # -------- VERDICT --------
-
-        if final_score >= 8:
-            verdict = "STRONG BUY 🟢"
-        elif final_score >= 6:
-            verdict = "BUY 🟢"
-        elif final_score >= 4:
-            verdict = "HOLD 🟡"
-        else:
-            verdict = "AVOID 🔴"
-
-        response = {
-            "stock": ticker,
-            "price": price,
-            "score": final_score,
-            "verdict": verdict,
-            "ratios": details,
-            "trend": "UPTREND" if trend else "DOWNTREND"
-        }
-
-        cache[ticker] = response
-        return response
-
-    except Exception as e:
-        return {"error": str(e)}
+    return {"stocks": results}
