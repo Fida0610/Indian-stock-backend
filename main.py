@@ -14,193 +14,172 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- CACHE ----------------
 cache = {}
 
-# ---------------- DEFINITIONS ----------------
-DEFINITIONS = {
-    "ROE": "Return on Equity - Profit generated from shareholders' money",
-    "ROCE": "Return on Capital Employed - Efficiency of capital usage",
-    "Debt": "Debt to Equity - Financial leverage (lower is better)",
-    "CurrentRatio": "Liquidity measure - ability to pay short-term liabilities",
-    "FCF": "Free Cash Flow - cash available after expenses",
+# -------- DEFINITIONS + IDEAL RANGES --------
+
+RATIO_INFO = {
+    "ROE": {"def": "Return on Equity", "ideal": "> 15%", "good": lambda x: x > 15},
+    "ROCE": {"def": "Return on Capital", "ideal": "> 18%", "good": lambda x: x > 18},
+    "Debt": {"def": "Debt to Equity", "ideal": "< 0.5", "good": lambda x: x < 0.5},
+    "CurrentRatio": {"def": "Liquidity", "ideal": "> 1.5", "good": lambda x: x > 1.5},
+    "PE": {"def": "Price to Earnings", "ideal": "< 25", "good": lambda x: x < 25},
+    "PB": {"def": "Price to Book", "ideal": "< 3", "good": lambda x: x < 3},
+    "Dividend": {"def": "Dividend Yield", "ideal": "> 1%", "good": lambda x: x > 1},
 }
 
-# ---------------- SAFE FUNCTIONS ----------------
+# -------- SAFE FUNCTIONS --------
 
 def safe_div(a, b):
-    if a is None or b is None:
+    if a is None or b in [None, 0]:
         return None
-    try:
-        if b == 0:
-            return None
-        return a / b
-    except:
-        return None
-
+    return a / b
 
 def safe_sub(a, b):
     if a is None or b is None:
         return None
-    try:
-        return a - b
-    except:
-        return None
+    return a - b
 
-
-# ---------------- RETRY FETCH ----------------
-
-def fetch_with_retry(stock):
+def fetch(stock):
     for _ in range(3):
         try:
-            data = stock.history(period="1y")
-            if data is not None and not data.empty:
-                return data
+            d = stock.history(period="1y")
+            if not d.empty:
+                return d
         except:
             pass
-        time.sleep(2 + random.random())
+        time.sleep(2)
     return None
 
-
-# ---------------- WATERFALL FETCH ----------------
-
-def get_value(df, keywords):
+def get(df, keys):
     try:
-        if df is None or df.empty:
-            return None
-
         for idx in df.index:
             name = str(idx).lower()
-            if any(k in name for k in keywords):
-                val = df.loc[idx].iloc[0]
-                if val is not None:
-                    return float(val)
+            if any(k in name for k in keys):
+                return float(df.loc[idx].iloc[0])
     except:
         pass
     return None
 
-
-# ---------------- ANALYZE ----------------
+# -------- MAIN API --------
 
 @app.get("/analyze")
 def analyze(ticker: str):
 
     ticker = ticker.upper()
 
-    # -------- CACHE --------
     if ticker in cache:
         return cache[ticker]
 
     try:
-        time.sleep(1) # prevent rate limit
-
         stock = yf.Ticker(ticker + ".NS")
 
-        hist = fetch_with_retry(stock)
-
+        hist = fetch(stock)
         if hist is None:
-            return {"error": "Data source busy. Try again."}
+            return {"error": "Data busy"}
 
         price = float(hist["Close"].iloc[-1])
-        dma50 = float(hist["Close"].tail(50).mean())
         dma200 = float(hist["Close"].tail(200).mean())
 
-        # -------- FINANCIALS --------
         fin = stock.financials
         bs = stock.balance_sheet
-        cf = stock.cashflow
 
-        net_income = get_value(fin, ["net income"])
-        ebit = get_value(fin, ["ebit"])
+        net_income = get(fin, ["net income"])
+        ebit = get(fin, ["ebit"])
 
-        equity = get_value(bs, ["equity"])
-        debt = get_value(bs, ["debt", "borrowings"])
-        total_assets = get_value(bs, ["total assets"])
+        equity = get(bs, ["equity"])
+        debt = get(bs, ["debt"])
+        total_assets = get(bs, ["total assets"])
+        current_liabilities = get(bs, ["current liabilities"])
 
-        current_assets = get_value(bs, ["current assets"])
-        current_liabilities = get_value(bs, ["current liabilities"])
-
-        op_cf = get_value(cf, ["operating cash"])
-        capex = get_value(cf, ["capital expenditure"])
-
-        if capex is not None:
-            capex = abs(capex)
-
-        # -------- CALCULATIONS (SAFE) --------
-        capital_employed = safe_sub(total_assets, current_liabilities)
+        # -------- RATIOS --------
 
         roe = safe_div(net_income, equity)
-        roce = safe_div(ebit, capital_employed)
-        debt_equity = safe_div(debt, equity)
-        current_ratio = safe_div(current_assets, current_liabilities)
-        fcf = safe_sub(op_cf, capex)
+        roce = safe_div(ebit, safe_sub(total_assets, current_liabilities))
+        debt_eq = safe_div(debt, equity)
 
-        # -------- FORMAT RATIOS --------
+        pe = stock.info.get("trailingPE")
+        pb = stock.info.get("priceToBook")
+        dividend = stock.info.get("dividendYield")
+
+        if dividend:
+            dividend *= 100
+
+        # -------- FORMAT --------
+
         def pct(x):
-            return round(x * 100, 2) if x is not None else None
+            return round(x * 100, 2) if x else None
 
         def num(x):
-            return round(x, 2) if x is not None else None
+            return round(x, 2) if x else None
 
         ratios = {
             "ROE": pct(roe),
             "ROCE": pct(roce),
-            "Debt": num(debt_equity),
-            "CurrentRatio": num(current_ratio),
-            "FCF": num(fcf),
+            "Debt": num(debt_eq),
+            "PE": num(pe),
+            "PB": num(pb),
+            "Dividend": num(dividend),
         }
 
-        # -------- SCORING (IGNORE NONE) --------
+        # -------- SCORING /10 --------
+
         score = 0
-        total = 0
-        reasons = []
+        max_score = 0
+        details = []
 
-        def check(value, condition, text):
-            nonlocal score, total
-            if value is not None:
-                total += 1
-                if condition:
-                    score += 1
-                    reasons.append(f"{text} ✅")
-                else:
-                    reasons.append(f"{text} ❌")
+        for k, v in ratios.items():
+            info = RATIO_INFO.get(k)
 
-        check(ratios["ROE"], ratios["ROE"] and ratios["ROE"] > 15, "ROE > 15")
-        check(ratios["ROCE"], ratios["ROCE"] and ratios["ROCE"] > 18, "ROCE > 18")
-        check(ratios["Debt"], ratios["Debt"] is not None and ratios["Debt"] < 0.5, "Low Debt")
-        check(ratios["CurrentRatio"], ratios["CurrentRatio"] and ratios["CurrentRatio"] > 1.5, "Good Liquidity")
-        check(ratios["FCF"], ratios["FCF"] and ratios["FCF"] > 0, "Positive Cash Flow")
-        check(price, price > dma200, "Above 200DMA")
+            if v is None or info is None:
+                continue
 
-        final_score = round(score / total, 2) if total > 0 else 0
+            max_score += 1
+            good = info["good"](v)
+
+            if good:
+                score += 1
+
+            details.append({
+                "name": k,
+                "value": v,
+                "ideal": info["ideal"],
+                "definition": info["def"],
+                "status": "GOOD" if good else "BAD"
+            })
+
+        # -------- TECH --------
+        trend = price > dma200
+
+        if trend:
+            score += 1
+        max_score += 1
+
+        # -------- FINAL SCORE --------
+
+        final_score = round((score / max_score) * 10, 1) if max_score else 0
 
         # -------- VERDICT --------
-        if final_score >= 0.8:
+
+        if final_score >= 8:
             verdict = "STRONG BUY 🟢"
-        elif final_score >= 0.6:
+        elif final_score >= 6:
             verdict = "BUY 🟢"
-        elif final_score >= 0.4:
+        elif final_score >= 4:
             verdict = "HOLD 🟡"
         else:
             verdict = "AVOID 🔴"
 
         response = {
             "stock": ticker,
-            "price": round(price, 2),
+            "price": price,
             "score": final_score,
             "verdict": verdict,
-            "ratios": ratios,
-            "definitions": DEFINITIONS,
-            "technical": {
-                "Above50DMA": price > dma50,
-                "Above200DMA": price > dma200
-            },
-            "reasons": reasons
+            "ratios": details,
+            "trend": "UPTREND" if trend else "DOWNTREND"
         }
 
-        # -------- CACHE SAVE --------
         cache[ticker] = response
-
         return response
 
     except Exception as e:
