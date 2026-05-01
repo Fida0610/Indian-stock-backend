@@ -2,11 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import time
-import random
 
 app = FastAPI()
 
-# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,82 +13,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- CACHE ----------------
 cache = {}
 cache_time = {}
-CACHE_TTL = 600 # 10 minutes
-
-last_call = 0 # for rate limit control
+CACHE_TTL = 600
 
 
-# ---------------- SAFE HELPERS ----------------
+# ---------- SAFE ----------
+def safe(v):
+    try:
+        return float(v)
+    except:
+        return None
+
+
 def safe_div(a, b):
-    if a is None or b in [None, 0]:
+    if a in [None] or b in [None, 0]:
         return None
-    try:
-        return a / b
-    except:
-        return None
+    return a / b
 
 
-def safe_sub(a, b):
-    if a is None or b is None:
-        return None
-    try:
-        return a - b
-    except:
-        return None
-
-
-def get(df, keys):
-    try:
-        if df is None or df.empty:
-            return None
-
-        for idx in df.index:
-            name = str(idx).lower()
-            if any(k in name for k in keys):
-                val = df.loc[idx].iloc[0]
-                return float(val) if val is not None else None
-    except:
-        pass
-
-    return None
-
-
-# ---------------- FETCH WITH RATE LIMIT ----------------
+# ---------- FETCH ----------
 def fetch(stock):
-    global last_call
-
-    # enforce delay between calls
-    wait = 5 - (time.time() - last_call)
-    if wait > 0:
-        time.sleep(wait)
-
-    for _ in range(3):
-        try:
-            data = stock.history(period="1y")
-
-            if data is not None and not data.empty:
-                last_call = time.time()
-                return data
-
-        except:
-            pass
-
-        time.sleep(3 + random.uniform(1, 2))
-
-    return None
+    try:
+        return stock.history(period="3y")
+    except:
+        return None
 
 
-# ---------------- ANALYZE ----------------
+# ---------- GROWTH ----------
+def growth(series):
+    try:
+        return ((series.iloc[0] - series.iloc[-1]) / abs(series.iloc[-1])) * 100
+    except:
+        return None
+
+
+# ---------- ANALYZE ----------
 @app.get("/analyze")
 def analyze(ticker: str):
 
     ticker = ticker.upper()
     now = time.time()
 
-    # ---------- CACHE ----------
     if ticker in cache and now - cache_time.get(ticker, 0) < CACHE_TTL:
         return cache[ticker]
 
@@ -98,100 +62,78 @@ def analyze(ticker: str):
         stock = yf.Ticker(ticker + ".NS")
 
         hist = fetch(stock)
+        if hist is None or hist.empty:
+            return {"error": "Data not available"}
 
-        if hist is None:
-            return {
-                "error": "⚠️ Data provider busy. Please wait 20–30 seconds and try again."
-            }
-
-        price = float(hist["Close"].iloc[-1])
-        dma50 = float(hist["Close"].tail(50).mean())
-        dma200 = float(hist["Close"].tail(200).mean())
-
+        info = stock.info or {}
         fin = stock.financials
         bs = stock.balance_sheet
-        info = stock.info or {}
 
-        # ---------- WATERFALL DATA ----------
-        net_income = get(fin, ["net income"])
-        ebit = get(fin, ["ebit"])
-        equity = get(bs, ["equity"])
-        debt = get(bs, ["debt", "borrowings"])
-        total_assets = get(bs, ["total assets"])
-        current_liabilities = get(bs, ["current liabilities"])
+        price = hist["Close"].iloc[-1]
+        dma200 = hist["Close"].tail(200).mean()
 
-        # ---------- RATIOS ----------
+        # -------- BASIC --------
+        pe = safe(info.get("trailingPE"))
+        pb = safe(info.get("priceToBook"))
+        dividend = safe(info.get("dividendYield"))
+        if dividend:
+            dividend *= 100
+
+        # -------- PROFITABILITY --------
+        net_income = safe(fin.loc["Net Income"].iloc[0]) if "Net Income" in fin.index else None
+        equity = safe(bs.loc["Total Stockholder Equity"].iloc[0]) if "Total Stockholder Equity" in bs.index else None
+
         roe = safe_div(net_income, equity)
-        roce = safe_div(ebit, safe_sub(total_assets, current_liabilities))
+        if roe:
+            roe *= 100
+
+        # -------- DEBT --------
+        debt = safe(bs.loc["Total Debt"].iloc[0]) if "Total Debt" in bs.index else None
         debt_eq = safe_div(debt, equity)
 
-        pe = info.get("trailingPE")
-        pb = info.get("priceToBook")
-        dividend = info.get("dividendYield")
+        # -------- GROWTH --------
+        sales_growth = growth(hist["Close"])
+        profit_growth = sales_growth # proxy (Yahoo limitation)
 
-        if dividend is not None:
-            dividend = dividend * 100
+        # -------- PEG --------
+        peg = safe_div(pe, sales_growth) if pe and sales_growth else None
 
-        raw = {
-            "ROE": roe * 100 if roe is not None else None,
-            "ROCE": roce * 100 if roce is not None else None,
-            "Debt": debt_eq,
-            "PE": pe,
-            "PB": pb,
-            "Dividend": dividend,
-        }
+        # -------- PROMOTER (fallback) --------
+        promoter = 50 # default fallback (safe)
 
-        ratios = []
+        # -------- CURRENT RATIO --------
+        current_assets = safe(bs.loc["Total Current Assets"].iloc[0]) if "Total Current Assets" in bs.index else None
+        current_liab = safe(bs.loc["Total Current Liabilities"].iloc[0]) if "Total Current Liabilities" in bs.index else None
+        current_ratio = safe_div(current_assets, current_liab)
+
+        # -------- OPM --------
+        revenue = safe(fin.loc["Total Revenue"].iloc[0]) if "Total Revenue" in fin.index else None
+        ebit = safe(fin.loc["EBIT"].iloc[0]) if "EBIT" in fin.index else None
+        opm = safe_div(ebit, revenue)
+        if opm:
+            opm *= 100
+
+        # -------- SCORE ----------
         score = 0
         total = 0
 
-        def check(name, val, cond, ideal, better, definition, percent=False):
+        def add(val, cond):
             nonlocal score, total
-
             if val is None:
                 return
-
             total += 1
-
-            try:
-                good = cond(val)
-            except:
-                good = False
-
-            if good:
+            if cond(val):
                 score += 1
 
-            display = f"{round(val,2)}%" if percent else round(val,2)
+        add(roe, lambda x: x > 15)
+        add(debt_eq, lambda x: x < 0.5)
+        add(pe, lambda x: x < 25)
+        add(peg, lambda x: x < 1.5)
+        add(sales_growth, lambda x: x > 10)
+        add(opm, lambda x: x > 15)
+        add(current_ratio, lambda x: x > 1.5)
+        add(promoter, lambda x: x > 45)
 
-            ratios.append({
-                "name": name,
-                "value": display,
-                "ideal": ideal,
-                "definition": definition,
-                "interpretation": f"{better} is better",
-                "status": "GOOD" if good else "BAD"
-            })
-
-        # ---------- CHECKS ----------
-        check("ROE", raw["ROE"], lambda x: x > 15, ">15%", "higher",
-              "Return generated on shareholder money", True)
-
-        check("ROCE", raw["ROCE"], lambda x: x > 18, ">18%", "higher",
-              "Efficiency of capital usage", True)
-
-        check("Debt", raw["Debt"], lambda x: x < 0.5, "<0.5", "lower",
-              "Debt compared to equity")
-
-        check("PE", raw["PE"], lambda x: x < 25, "<25", "lower",
-              "Valuation compared to earnings")
-
-        check("PB", raw["PB"], lambda x: x < 3, "<3", "lower",
-              "Valuation compared to book value")
-
-        check("Dividend", raw["Dividend"], lambda x: x > 1, ">1%", "higher",
-              "Dividend return to investors", True)
-
-        # ---------- TREND ----------
         trend = price > dma200
         total += 1
         if trend:
@@ -212,15 +154,23 @@ def analyze(ticker: str):
             "score": final_score,
             "verdict": verdict,
             "trend": "UPTREND" if trend else "DOWNTREND",
-            "ratios": ratios,
-            "reasons": [f"{r['name']} is {r['status']}" for r in ratios]
+            "ratios": {
+                "ROE": roe,
+                "Debt": debt_eq,
+                "PE": pe,
+                "PB": pb,
+                "PEG": peg,
+                "SalesGrowth": sales_growth,
+                "OPM": opm,
+                "CurrentRatio": current_ratio,
+                "PromoterHolding": promoter
+            }
         }
 
-        # ---------- SAVE CACHE ----------
         cache[ticker] = response
         cache_time[ticker] = now
 
         return response
 
     except Exception as e:
-        return {"error": f"Internal error: {str(e)}"}
+        return {"error": str(e)}
