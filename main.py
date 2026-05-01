@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import requests
+from bs4 import BeautifulSoup
 import yfinance as yf
 import time
 
@@ -22,7 +24,7 @@ CACHE_TTL = 600
 # -------- SAFE --------
 def safe(v):
     try:
-        return float(v)
+        return float(str(v).replace("%", "").replace(",", ""))
     except:
         return None
 
@@ -33,38 +35,44 @@ def safe_div(a, b):
     return a / b
 
 
-def get(df, keys):
+# -------- SCRAPER (PRIMARY DATA) --------
+def fetch_screener(ticker):
     try:
-        if df is None or df.empty:
-            return None
-        for idx in df.index:
-            if any(k in str(idx).lower() for k in keys):
-                return safe(df.loc[idx].iloc[0])
+        url = f"https://www.screener.in/company/{ticker}/"
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        data = {}
+
+        for li in soup.select("li.flex.flex-space-between"):
+            name = li.find("span", class_="name")
+            val = li.find("span", class_="number")
+
+            if name and val:
+                data[name.text.strip()] = safe(val.text.strip())
+
+        return data
     except:
-        pass
-    return None
+        return {}
 
 
-# -------- FETCH WITH RETRY --------
-def fetch_history(stock):
-    for i in range(3):
-        try:
-            data = stock.history(period="6mo")
-            if data is not None and not data.empty:
-                return data
-        except:
-            pass
-        time.sleep(2)
-    return None
+# -------- YAHOO (FALLBACK) --------
+def fetch_yahoo(ticker):
+    try:
+        stock = yf.Ticker(ticker + ".NS")
+        info = stock.info
+        hist = stock.history(period="6mo")
 
-
-def fetch_info(stock):
-    for i in range(2):
-        try:
-            return stock.info
-        except:
-            time.sleep(1)
-    return {}
+        return {
+            "price": hist["Close"].iloc[-1] if not hist.empty else None,
+            "pe": info.get("trailingPE"),
+            "pb": info.get("priceToBook"),
+            "dividend": info.get("dividendYield"),
+        }
+    except:
+        return {}
 
 
 # -------- ANALYZE --------
@@ -74,123 +82,85 @@ def analyze(ticker: str):
     ticker = ticker.upper()
     now = time.time()
 
-    # -------- CACHE --------
     if ticker in cache and now - cache_time.get(ticker, 0) < CACHE_TTL:
         return cache[ticker]
 
     try:
-        stock = yf.Ticker(ticker + ".NS")
+        # -------- WATERFALL --------
+        screener = fetch_screener(ticker)
+        yahoo = fetch_yahoo(ticker)
 
-        hist = fetch_history(stock)
-        info = fetch_info(stock)
+        price = yahoo.get("price")
 
-        # -------- FALLBACK --------
-        if hist is None:
-            if ticker in cache:
-                return {
-                    **cache[ticker],
-                    "note": "⚠️ Showing cached data (live unavailable)"
-                }
-            return {"error": "⚠️ Data provider busy. Try again in 30 sec"}
+        pe = screener.get("Stock P/E") or yahoo.get("pe")
+        pb = screener.get("Price to book value") or yahoo.get("pb")
+        roe = screener.get("ROE")
+        roce = screener.get("ROCE")
+        debt = screener.get("Debt to equity")
+        npm = screener.get("Net Profit Margin")
+        current_ratio = screener.get("Current ratio")
 
-        price = float(hist["Close"].iloc[-1])
-        dma200 = float(hist["Close"].tail(200).mean())
-
-        fin = stock.financials
-        bs = stock.balance_sheet
-
-        # -------- WATERFALL DATA --------
-        net_income = get(fin, ["net income"])
-        ebit = get(fin, ["ebit"])
-        revenue = get(fin, ["total revenue"])
-        interest = get(fin, ["interest"])
-
-        equity = get(bs, ["equity"])
-        debt = get(bs, ["debt"])
-        assets = get(bs, ["total assets"])
-        current_assets = get(bs, ["current assets"])
-        current_liab = get(bs, ["current liabilities"])
-        inventory = get(bs, ["inventory"])
-
-        # -------- RATIOS --------
-        roe = safe_div(net_income, equity)
-        roce = safe_div(ebit, equity)
-        npm = safe_div(net_income, revenue)
-        debt_eq = safe_div(debt, equity)
-        interest_cov = safe_div(ebit, interest)
-        asset_turn = safe_div(revenue, assets)
-        inventory_turn = safe_div(revenue, inventory)
-        current_ratio = safe_div(current_assets, current_liab)
-        quick_ratio = safe_div(
-            (current_assets - inventory) if current_assets and inventory else None,
-            current_liab
-        )
-
-        pe = safe(info.get("trailingPE"))
-        pb = safe(info.get("priceToBook"))
-
-        dividend = info.get("dividendYield")
-        if dividend is not None:
+        dividend = yahoo.get("dividend")
+        if dividend:
             dividend = round(dividend * 100, 2)
             if dividend > 50:
                 dividend = None
 
         peg = safe_div(pe, roe) if pe and roe else None
 
-        # -------- FORMAT --------
-        def pct(x): return round(x * 100, 2) if x else None
-        def num(x): return round(x, 2) if x else None
-
+        # -------- RATIOS --------
         ratios = []
 
-        def add(name, value, ideal, better, definition, percent=False):
-            if value is None:
-                return
+        def add(name, val, ideal, better, definition, pct=False):
+            if val is None:
+                return 0, 0
 
-            val = pct(value) if percent else num(value)
+            display = round(val, 2)
+            if pct:
+                display_str = f"{display}%"
+            else:
+                display_str = display
 
             good = False
             try:
                 if better == "HIGH":
-                    good = val > float(ideal.replace(">", "").replace("%", ""))
+                    good = display > float(ideal.replace(">", "").replace("%", ""))
                 else:
-                    good = val < float(ideal.replace("<", ""))
+                    good = display < float(ideal.replace("<", ""))
             except:
                 pass
 
             ratios.append({
                 "name": name,
-                "value": f"{val}%" if percent else val,
+                "value": display_str,
                 "ideal": ideal,
                 "interpretation": f"{better} is better",
                 "definition": definition,
                 "status": "GOOD" if good else "WEAK"
             })
 
-        # -------- ADD RATIOS --------
-        add("ROE", roe, ">15%", "HIGH", "Profit generated on shareholder money", True)
-        add("ROCE", roce, ">18%", "HIGH", "Capital efficiency", True)
-        add("Net Profit Margin", npm, ">10%", "HIGH", "Profit after expenses", True)
-        add("P/E Ratio", pe, "<25", "LOW", "Valuation vs earnings")
-        add("PEG Ratio", peg, "<1.5", "LOW", "Valuation adjusted for growth")
-        add("Debt to Equity", debt_eq, "<0.5", "LOW", "Debt burden")
-        add("Interest Coverage", interest_cov, ">3", "HIGH", "Interest safety")
-        add("Asset Turnover", asset_turn, ">1", "HIGH", "Revenue efficiency")
-        add("Inventory Turnover", inventory_turn, ">3", "HIGH", "Stock efficiency")
-        add("Current Ratio", current_ratio, ">1.5", "HIGH", "Liquidity")
-        add("Quick Ratio", quick_ratio, ">1", "HIGH", "Liquidity without inventory")
+            return (1 if good else 0), 1
+
+        score = 0
+        total = 0
+
+        def add_wrap(*args, **kwargs):
+            nonlocal score, total
+            s, t = add(*args, **kwargs)
+            score += s
+            total += t
+
+        add_wrap("ROE", roe, ">15%", "HIGH", "Profit generated from equity", True)
+        add_wrap("ROCE", roce, ">18%", "HIGH", "Capital efficiency", True)
+        add_wrap("Net Profit Margin", npm, ">10%", "HIGH", "Profit after expenses", True)
+        add_wrap("P/E Ratio", pe, "<25", "LOW", "Valuation vs earnings")
+        add_wrap("PEG Ratio", peg, "<1.5", "LOW", "Growth adjusted valuation")
+        add_wrap("Debt to Equity", debt, "<0.5", "LOW", "Debt burden")
+        add_wrap("Current Ratio", current_ratio, ">1.5", "HIGH", "Liquidity")
 
         # -------- SCORE --------
-        score = sum(1 for r in ratios if r["status"] == "GOOD")
-        total = len(ratios) + 1
+        final_score = round((score / total) * 10, 1) if total else 0
 
-        trend = price > dma200
-        if trend:
-            score += 1
-
-        final_score = round((score / total) * 10, 1)
-
-        # -------- VERDICT --------
         verdict = (
             "STRONG BUY 🟢" if final_score >= 8 else
             "BUY 🟢" if final_score >= 6 else
@@ -199,14 +169,13 @@ def analyze(ticker: str):
         )
 
         reasons = [f"{r['name']} is {r['status']}" for r in ratios]
-        reasons.append("Uptrend" if trend else "Downtrend")
 
         response = {
             "stock": ticker,
-            "price": round(price, 2),
+            "price": round(price, 2) if price else None,
             "score": final_score,
             "verdict": verdict,
-            "trend": "UPTREND" if trend else "DOWNTREND",
+            "trend": "N/A",
             "ratios": ratios,
             "reasons": reasons
         }
@@ -216,5 +185,5 @@ def analyze(ticker: str):
 
         return response
 
-    except Exception as e:
-        return {"error": "Something went wrong. Please try again."}
+    except Exception:
+        return {"error": "System busy. Try again shortly."}
