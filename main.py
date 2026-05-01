@@ -13,14 +13,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --------- CACHE ----------
 cache = {}
 cache_time = {}
-CACHE_TTL = 600
+CACHE_TTL = 600 # 10 minutes
 
 
-# ---------- SAFE ----------
+# --------- SAFE HELPERS ----------
 def safe(v):
     try:
+        if v is None:
+            return None
         return float(v)
     except:
         return None
@@ -29,24 +32,82 @@ def safe(v):
 def safe_div(a, b):
     if a in [None] or b in [None, 0]:
         return None
-    return a / b
-
-
-# ---------- FETCH ----------
-def fetch(stock):
     try:
-        return stock.history(period="1y")
+        return a / b
     except:
         return None
 
 
-# ---------- MAIN ANALYSIS ----------
+def get(df, keys):
+    """Find a row in financial statements using fuzzy keys"""
+    try:
+        if df is None or df.empty:
+            return None
+        for idx in df.index:
+            name = str(idx).lower()
+            if any(k in name for k in keys):
+                val = df.loc[idx].iloc[0]
+                return float(val) if val is not None else None
+    except:
+        pass
+    return None
+
+
+# --------- FETCH ----------
+def fetch(stock):
+    try:
+        data = stock.history(period="1y")
+        if data is not None and not data.empty:
+            return data
+    except:
+        pass
+    return None
+
+
+# --------- RATIO ENGINE ----------
+def add_ratio(ratios, name, value, ideal, better, definition, is_pct=False):
+    if value is None:
+        return 0, 0 # score, total
+
+    # display
+    val_disp = round(value, 2)
+    if is_pct:
+        val_disp_str = f"{val_disp}%"
+    else:
+        val_disp_str = val_disp
+
+    # evaluate
+    good = False
+    try:
+        if better == "HIGH":
+            thr = float(ideal.replace(">", "").replace("%", "").strip())
+            good = val_disp > thr
+        else:
+            thr = float(ideal.replace("<", "").strip())
+            good = val_disp < thr
+    except:
+        good = False
+
+    ratios.append({
+        "name": name,
+        "value": val_disp_str,
+        "ideal": ideal,
+        "interpretation": f"{better} is better",
+        "definition": definition,
+        "status": "GOOD" if good else "WEAK"
+    })
+
+    return (1 if good else 0), 1
+
+
+# --------- ANALYZE ----------
 @app.get("/analyze")
 def analyze(ticker: str):
 
-    ticker = ticker.upper()
+    ticker = (ticker or "").upper()
     now = time.time()
 
+    # cache
     if ticker in cache and now - cache_time.get(ticker, 0) < CACHE_TTL:
         return cache[ticker]
 
@@ -54,89 +115,125 @@ def analyze(ticker: str):
         stock = yf.Ticker(ticker + ".NS")
 
         hist = fetch(stock)
-        if hist is None or hist.empty:
-            return {"error": "Data not available"}
-
-        info = stock.info or {}
-        fin = stock.financials
-        bs = stock.balance_sheet
+        if hist is None:
+            return {"error": "Data busy. Please try again in a few seconds."}
 
         price = float(hist["Close"].iloc[-1])
         dma200 = float(hist["Close"].tail(200).mean())
 
-        # ---------- WATERFALL ----------
-        net_income = safe(fin.loc["Net Income"].iloc[0]) if "Net Income" in fin.index else None
-        equity = safe(bs.loc["Total Stockholder Equity"].iloc[0]) if "Total Stockholder Equity" in bs.index else None
-        debt = safe(bs.loc["Total Debt"].iloc[0]) if "Total Debt" in bs.index else None
-        ebit = safe(fin.loc["EBIT"].iloc[0]) if "EBIT" in fin.index else None
-        revenue = safe(fin.loc["Total Revenue"].iloc[0]) if "Total Revenue" in fin.index else None
+        fin = stock.financials
+        bs = stock.balance_sheet
+        info = stock.info or {}
 
-        current_assets = safe(bs.loc["Total Current Assets"].iloc[0]) if "Total Current Assets" in bs.index else None
-        current_liab = safe(bs.loc["Total Current Liabilities"].iloc[0]) if "Total Current Liabilities" in bs.index else None
+        # -------- WATERFALL DATA ----------
+        net_income = get(fin, ["net income"])
+        ebit = get(fin, ["ebit"])
+        revenue = get(fin, ["total revenue"])
+        interest = get(fin, ["interest"])
 
-        # ---------- RATIOS ----------
-        roe = safe_div(net_income, equity)
-        roce = safe_div(ebit, equity)
-        debt_eq = safe_div(debt, equity)
-        current_ratio = safe_div(current_assets, current_liab)
+        equity = get(bs, ["equity"])
+        debt = get(bs, ["debt", "borrowings"])
+        total_assets = get(bs, ["total assets"])
+        current_assets = get(bs, ["current assets"])
+        current_liab = get(bs, ["current liabilities"])
+        inventory = get(bs, ["inventory"])
 
+        # -------- BASIC MARKET ----------
         pe = safe(info.get("trailingPE"))
         pb = safe(info.get("priceToBook"))
-        dividend = safe(info.get("dividendYield"))
-        if dividend:
-            dividend *= 100
 
-        opm = safe_div(ebit, revenue)
-        if opm:
-            opm *= 100
+        dividend = info.get("dividendYield")
+        if dividend is not None:
+            dividend = round(dividend * 100, 2) # FIXED (only once)
+            if dividend > 50: # sanity cap
+                dividend = None
 
-        # ---------- FORMAT ----------
-        def pct(x): return round(x * 100, 2) if x else None
-        def num(x): return round(x, 2) if x else None
+        # -------- RATIOS ----------
+        roe = safe_div(net_income, equity)
+        if roe is not None:
+            roe *= 100
 
+        roce = safe_div(ebit, equity)
+        if roce is not None:
+            roce *= 100
+
+        net_margin = safe_div(net_income, revenue)
+        if net_margin is not None:
+            net_margin *= 100
+
+        debt_eq = safe_div(debt, equity)
+
+        interest_cov = safe_div(ebit, interest)
+
+        asset_turnover = safe_div(revenue, total_assets)
+
+        inventory_turnover = safe_div(revenue, inventory)
+
+        current_ratio = safe_div(current_assets, current_liab)
+
+        quick_ratio = safe_div(
+            (current_assets - inventory) if current_assets and inventory else None,
+            current_liab
+        )
+
+        # PEG (approx using earnings growth proxy)
+        peg = None
+        if pe and roe:
+            peg = safe_div(pe, roe)
+
+        # -------- BUILD RATIOS ----------
         ratios = []
+        score = 0
+        total = 0
 
-        def add(name, value, ideal, better, definition, is_pct=False):
-            if value is None:
-                return
+        def add(*args, **kwargs):
+            nonlocal score, total
+            s, t = add_ratio(ratios, *args, **kwargs)
+            score += s
+            total += t
 
-            val = pct(value) if is_pct else num(value)
+        add("ROE", roe, ">15%", "HIGH",
+            "Return on Equity: how much profit company generates from shareholder money", True)
 
-            good = (
-                (better == "HIGH" and val > float(ideal.strip("> %")))
-                or (better == "LOW" and val < float(ideal.strip("< ")))
-            )
+        add("ROCE", roce, ">18%", "HIGH",
+            "Return on Capital: how efficiently total capital is used", True)
 
-            ratios.append({
-                "name": name,
-                "value": f"{val}%" if is_pct else val,
-                "ideal": ideal,
-                "interpretation": f"{better} is better",
-                "definition": definition,
-                "status": "GOOD" if good else "WEAK"
-            })
+        add("Net Profit Margin", net_margin, ">10%", "HIGH",
+            "Profit after all expenses from total sales", True)
 
-        # ---------- ADD RATIOS ----------
-        add("ROE", roe, ">15%", "HIGH", "Profit generated per ₹100 shareholder money", True)
-        add("ROCE", roce, ">18%", "HIGH", "Efficiency of total capital", True)
-        add("Debt to Equity", debt_eq, "<0.5", "LOW", "Debt burden on company")
-        add("Current Ratio", current_ratio, ">1.5", "HIGH", "Liquidity strength")
-        add("PE Ratio", pe, "<25", "LOW", "Valuation vs earnings")
-        add("PB Ratio", pb, "<3", "LOW", "Valuation vs assets")
-        add("Dividend Yield", dividend, ">1%", "HIGH", "Cash return", True)
-        add("OPM", opm, ">15%", "HIGH", "Operating efficiency", True)
+        add("P/E Ratio", pe, "<25", "LOW",
+            "Price vs earnings: lower means cheaper stock")
 
-        # ---------- SCORE ----------
-        score = sum(1 for r in ratios if r["status"] == "GOOD")
-        total = len(ratios) + 1
+        add("PEG Ratio", peg, "<1.5", "LOW",
+            "Valuation adjusted for growth: lower is better")
 
+        add("Debt to Equity", debt_eq, "<0.5", "LOW",
+            "How much debt company has compared to equity")
+
+        add("Interest Coverage", interest_cov, ">3", "HIGH",
+            "Ability to pay interest: higher means safer")
+
+        add("Asset Turnover", asset_turnover, ">1", "HIGH",
+            "How efficiently assets generate revenue")
+
+        add("Inventory Turnover", inventory_turnover, ">3", "HIGH",
+            "How fast inventory is sold")
+
+        add("Current Ratio", current_ratio, ">1.5", "HIGH",
+            "Short-term liquidity strength")
+
+        add("Quick Ratio", quick_ratio, ">1", "HIGH",
+            "Liquidity excluding inventory")
+
+        # -------- TREND ----------
         trend = price > dma200
+        total += 1
         if trend:
             score += 1
 
         final_score = round((score / total) * 10, 1) if total else 0
 
-        # ---------- VERDICT ----------
+        # -------- VERDICT ----------
         if final_score >= 8:
             verdict = "STRONG BUY 🟢"
         elif final_score >= 6:
@@ -165,11 +262,14 @@ def analyze(ticker: str):
         return response
 
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Internal error: {str(e)}"}
 
 
-# ---------- SCREENER (FIXED) ----------
-STOCKS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "ITC"]
+# --------- SCREENER ----------
+STOCKS = [
+    "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK",
+    "ITC","LT","SBIN","AXISBANK","HINDUNILVR"
+]
 
 @app.get("/screener")
 def screener():
